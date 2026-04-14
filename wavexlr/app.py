@@ -330,11 +330,25 @@ class WaveXLRWindow(Adw.ApplicationWindow):
 
 
 class WaveXLRApp(Adw.Application):
-    def __init__(self, start_hidden=False):
-        super().__init__(application_id="com.github.openwave")
+    def __init__(self):
+        super().__init__(
+            application_id="com.github.openwave",
+            flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE,
+        )
         self._window = None
-        self._start_hidden = start_hidden
+        self._start_hidden = False
         self._tray = None
+        self.add_main_option(
+            "hide", 0, GLib.OptionFlags.NONE, GLib.OptionArg.NONE,
+            "Start hidden in system tray", None,
+        )
+
+    def do_command_line(self, command_line):
+        options = command_line.get_options_dict()
+        if options.contains("hide"):
+            self._start_hidden = True
+        self.activate()
+        return 0
 
     def do_activate(self):
         if not self._window:
@@ -446,8 +460,5 @@ class WaveXLRApp(Adw.Application):
 
 
 def main():
-    hidden = "--hide" in sys.argv
-    argv = [a for a in sys.argv if a != "--hide"]
-    app = WaveXLRApp(start_hidden=hidden)
-    app.set_flags(Gio.ApplicationFlags.DEFAULT_FLAGS)
-    app.run(argv)
+    app = WaveXLRApp()
+    app.run(sys.argv)
