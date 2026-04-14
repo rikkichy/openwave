@@ -58,10 +58,6 @@ wavexlr/
   setup.py    — First-run udev + systemd setup
 ```
 
-## Protocol documentation
-
-See [`docs/protocol.md`](docs/protocol.md) for the full reverse-engineered USB protocol specification.
-
 ## Credits
 
 USB protocol reverse-engineered from the macOS Wave Link application using Frida. Inspired by [GoXLR-on-Linux/goxlr-utility](https://github.com/GoXLR-on-Linux/goxlr-utility).
