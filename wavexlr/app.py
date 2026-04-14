@@ -65,6 +65,12 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         self.audio_status_icon = Gtk.Image(icon_name="emblem-ok-symbolic")
         self.audio_status_icon.add_css_class("dim-label")
         self.audio_status_row.add_suffix(self.audio_status_icon)
+
+        self.uninstall_btn = Gtk.Button(icon_name="user-trash-symbolic", valign=Gtk.Align.CENTER, tooltip_text="Uninstall capture fix")
+        self.uninstall_btn.add_css_class("flat")
+        self.uninstall_btn.connect("clicked", self._on_uninstall_clicked)
+        self.audio_status_row.add_suffix(self.uninstall_btn)
+
         status_group.add(self.audio_status_row)
 
         # --- Mic controls ---
@@ -167,9 +173,33 @@ class WaveXLRWindow(Adw.ApplicationWindow):
             self.audio_status_icon.set_from_icon_name("emblem-ok-symbolic")
             self.audio_status_icon.remove_css_class("dim-label")
             self.audio_status_row.set_subtitle("Audio service running")
+            self.uninstall_btn.set_visible(True)
         else:
             self.audio_status_icon.set_from_icon_name("dialog-warning-symbolic")
             self.audio_status_row.set_subtitle("Audio service not running")
+            self.uninstall_btn.set_visible(False)
+
+    def _on_uninstall_clicked(self, btn):
+        dialog = Adw.AlertDialog(
+            heading="Uninstall Capture Fix?",
+            body="This will remove the audio service and USB permissions.\n\nYou can reinstall them by restarting OpenWave.",
+        )
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("uninstall", "Uninstall")
+        dialog.set_response_appearance("uninstall", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_default_response("cancel")
+        dialog.choose(self, None, self._on_uninstall_response)
+
+    def _on_uninstall_response(self, dialog, result):
+        response = dialog.choose_finish(result)
+        if response != "uninstall":
+            return
+        success, message = setup.run_uninstall()
+        self._update_service_status()
+        if not success:
+            err = Adw.AlertDialog(heading="Uninstall Failed", body=message)
+            err.add_response("ok", "OK")
+            err.choose(self, None, lambda d, r: d.choose_finish(r))
 
     def _usb_async(self, fn, on_done=None, on_error=None):
         """Run fn in a background thread; call on_done/on_error on GTK thread."""

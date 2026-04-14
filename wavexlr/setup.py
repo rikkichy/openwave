@@ -103,3 +103,50 @@ def run_setup():
             return False, f"Failed to install service: {e}"
 
     return True, ". ".join(messages) if messages else "Already configured"
+
+
+def uninstall_service():
+    """Stop, disable, and remove the systemd user service."""
+    subprocess.run(["systemctl", "--user", "stop", SERVICE_NAME], capture_output=True)
+    subprocess.run(["systemctl", "--user", "disable", SERVICE_NAME], capture_output=True)
+    path = os.path.join(os.path.expanduser("~/.config/systemd/user"), SERVICE_NAME)
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+
+
+def uninstall_udev():
+    """Remove udev rule via pkexec."""
+    script = f"""#!/bin/sh
+rm -f {UDEV_PATH}
+udevadm control --reload-rules
+"""
+    tmp = "/tmp/openwave-udev-remove.sh"
+    with open(tmp, "w") as f:
+        f.write(script)
+    os.chmod(tmp, 0o755)
+    r = subprocess.run(["pkexec", tmp], capture_output=True, text=True)
+    try:
+        os.unlink(tmp)
+    except FileNotFoundError:
+        pass
+    return r.returncode == 0
+
+
+def run_uninstall():
+    """Remove capture fix service and udev rule. Returns (success, message)."""
+    messages = []
+
+    if service_installed():
+        uninstall_service()
+        messages.append("Audio service removed")
+
+    if udev_installed():
+        if uninstall_udev():
+            messages.append("USB permissions removed")
+        else:
+            return False, "Failed to remove USB permissions (pkexec cancelled?)"
+
+    return True, ". ".join(messages) if messages else "Already uninstalled"
