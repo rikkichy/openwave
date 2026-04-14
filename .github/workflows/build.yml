@@ -1,0 +1,120 @@
+name: Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version bump type"
+        required: true
+        default: "patch"
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+      aur:
+        description: "Publish to AUR?"
+        required: true
+        default: "yes"
+        type: choice
+        options:
+          - "yes"
+          - "no"
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Bump version
+        id: bump
+        run: |
+          OLD_VER=$(grep -oP 'pkgver=\K.*' PKGBUILD)
+
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$OLD_VER"
+          case "${{ inputs.bump }}" in
+            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+            patch) PATCH=$((PATCH + 1)) ;;
+          esac
+          NEW_VER="${MAJOR}.${MINOR}.${PATCH}"
+
+          sed -i "s/pkgver=$OLD_VER/pkgver=$NEW_VER/" PKGBUILD
+          sed -i "s/pkgrel=.*/pkgrel=1/" PKGBUILD
+
+          echo "version=$NEW_VER" >> "$GITHUB_OUTPUT"
+          echo "Bumped $OLD_VER → $NEW_VER"
+
+      - name: Commit and tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add PKGBUILD
+          git commit -m "Bump version to v${{ steps.bump.outputs.version }}"
+          git tag "v${{ steps.bump.outputs.version }}"
+          git push
+          git push origin "v${{ steps.bump.outputs.version }}" --force
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: v${{ steps.bump.outputs.version }}
+        run: |
+          BODY="### Changes
+          + No changes."
+
+          gh release create "$TAG" --draft --title "$TAG" --notes "$BODY"
+
+  aur:
+    name: Publish to AUR
+    needs: release
+    if: inputs.aur == 'yes'
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+
+    steps:
+      - name: Install dependencies
+        run: pacman -Syu --noconfirm git openssh
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.AUR_SSH_PRIVATE_KEY }}" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          ssh-keyscan -v -t ed25519,rsa aur.archlinux.org > ~/.ssh/known_hosts 2>&1 || true
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: v${{ needs.release.outputs.version }}
+
+      - name: Push to AUR
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+          GIT_SSH_COMMAND: "ssh -i ~/.ssh/aur -o StrictHostKeyChecking=accept-new"
+        run: |
+          git config --global user.name "${{ secrets.AUR_USERNAME }}"
+          git config --global user.email "${{ secrets.AUR_EMAIL }}"
+          git config --global --add safe.directory '*'
+
+          git clone ssh://aur@aur.archlinux.org/openwave.git aur-repo
+          cp PKGBUILD aur-repo/PKGBUILD
+
+          useradd -m builder
+          chown -R builder:builder aur-repo
+          cd aur-repo
+          su builder -c "makepkg --printsrcinfo" > .SRCINFO
+
+          git add PKGBUILD .SRCINFO
+          git commit -m "Update to v${VERSION}"
+          git push
