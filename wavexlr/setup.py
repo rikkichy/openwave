@@ -6,16 +6,20 @@ import shutil
 
 UDEV_RULE = 'SUBSYSTEM=="usb", ATTR{idVendor}=="0fd9", ATTR{idProduct}=="007d", MODE="0666"'
 UDEV_PATH = "/etc/udev/rules.d/99-openwave.rules"
+UDEV_PATH_OLD = "/etc/udev/rules.d/99-wavexlr.rules"
 SERVICE_NAME = "openwave.service"
 APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def udev_installed():
-    try:
-        with open(UDEV_PATH) as f:
-            return "0fd9" in f.read()
-    except (FileNotFoundError, PermissionError):
-        return False
+    for path in (UDEV_PATH, UDEV_PATH_OLD):
+        try:
+            with open(path) as f:
+                if "0fd9" in f.read():
+                    return True
+        except (FileNotFoundError, PermissionError):
+            continue
+    return False
 
 
 def service_installed():
@@ -120,7 +124,7 @@ def uninstall_service():
 def uninstall_udev():
     """Remove udev rule via pkexec."""
     script = f"""#!/bin/sh
-rm -f {UDEV_PATH}
+rm -f {UDEV_PATH} {UDEV_PATH_OLD}
 udevadm control --reload-rules
 """
     tmp = "/tmp/openwave-udev-remove.sh"
