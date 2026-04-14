@@ -378,6 +378,8 @@ class WaveXLRApp(Adw.Application):
             on_quit=self._quit_app,
         )
         self._tray.register()
+        # Keep app alive when window is hidden
+        self.hold()
 
     def _toggle_mute(self):
         if self._window and self._window.xlr.connected:
@@ -386,8 +388,6 @@ class WaveXLRApp(Adw.Application):
                 lambda: self._window.xlr.set_mute(not current),
                 on_error=self._window._on_usb_error,
             )
-        # Hold the app alive when window is hidden
-        self.hold()
 
     def _quit_app(self):
         self.release()
