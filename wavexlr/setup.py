@@ -1,4 +1,4 @@
-"""First-run setup: udev rule, audio service."""
+"""First-run setup: udev rule, WirePlumber rule, audio service."""
 
 import os
 import subprocess
@@ -8,6 +8,15 @@ from . import service
 UDEV_RULE = 'SUBSYSTEM=="usb", ATTR{idVendor}=="0fd9", ATTR{idProduct}=="007d", MODE="0666"'
 UDEV_PATH = "/etc/udev/rules.d/99-openwave.rules"
 UDEV_PATH_OLD = "/etc/udev/rules.d/99-wavexlr.rules"
+
+_APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+WIREPLUMBER_SOURCES = (
+    os.path.join(_APP_DIR, "wireplumber", "51-openwave-wave-xlr.conf"),
+    "/usr/share/openwave/wireplumber/51-openwave-wave-xlr.conf",
+)
+WIREPLUMBER_PATH = os.path.expanduser(
+    "~/.config/wireplumber/wireplumber.conf.d/51-openwave-wave-xlr.conf"
+)
 
 
 def udev_installed():
@@ -25,8 +34,16 @@ def service_installed():
     return service.is_installed()
 
 
+def wireplumber_installed():
+    return os.path.exists(WIREPLUMBER_PATH)
+
+
 def needs_setup():
-    return not udev_installed() or not service_installed()
+    return (
+        not udev_installed()
+        or not service_installed()
+        or not wireplumber_installed()
+    )
 
 
 def install_udev():
@@ -60,6 +77,24 @@ def install_service():
     return True
 
 
+def install_wireplumber():
+    """Drop the suspend-disable rule into the user's WirePlumber config."""
+    for src in WIREPLUMBER_SOURCES:
+        if os.path.exists(src):
+            with open(src) as f:
+                content = f.read()
+            break
+    else:
+        raise FileNotFoundError(
+            "WirePlumber rule source not found. Looked in: "
+            + ", ".join(WIREPLUMBER_SOURCES)
+        )
+    os.makedirs(os.path.dirname(WIREPLUMBER_PATH), exist_ok=True)
+    with open(WIREPLUMBER_PATH, "w") as f:
+        f.write(content)
+    return True
+
+
 def run_setup():
     """Run full first-time setup. Returns (success, message)."""
     messages = []
@@ -69,6 +104,17 @@ def run_setup():
             messages.append("USB permissions configured")
         else:
             return False, "Failed to set up USB permissions (pkexec cancelled?)"
+
+    # Install the WirePlumber rule before starting the service so the daemon's
+    # pw-cat attaches to a node that already has suspend disabled.
+    if not wireplumber_installed():
+        try:
+            install_wireplumber()
+            messages.append(
+                "WirePlumber rule installed (restart wireplumber to apply)"
+            )
+        except Exception as e:
+            return False, f"Failed to install WirePlumber rule: {e}"
 
     if not service_installed():
         try:
@@ -83,6 +129,15 @@ def run_setup():
 def uninstall_service():
     """Stop, disable, and remove the audio service via the active backend."""
     service.uninstall()
+
+
+def uninstall_wireplumber():
+    """Remove the WirePlumber rule from the user's config."""
+    try:
+        os.unlink(WIREPLUMBER_PATH)
+    except FileNotFoundError:
+        return False
+    return True
 
 
 def uninstall_udev():
@@ -104,7 +159,7 @@ udevadm control --reload-rules
 
 
 def run_uninstall():
-    """Remove capture fix service and udev rule. Returns (success, message)."""
+    """Remove capture fix service, WirePlumber rule, and udev rule. Returns (success, message)."""
     messages = []
 
     if service_installed():
@@ -113,6 +168,10 @@ def run_uninstall():
             messages.append("Audio service removed")
         except Exception as e:
             return False, f"Failed to remove service: {e}"
+
+    if wireplumber_installed():
+        if uninstall_wireplumber():
+            messages.append("WirePlumber rule removed")
 
     if udev_installed():
         if uninstall_udev():

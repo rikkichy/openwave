@@ -31,4 +31,8 @@ package() {
 
     # Docs
     install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+
+    # WirePlumber rule (read by setup.py at first-run, copied to user config)
+    install -Dm644 wireplumber/51-openwave-wave-xlr.conf \
+        "$pkgdir/usr/share/openwave/wireplumber/51-openwave-wave-xlr.conf"
 }
