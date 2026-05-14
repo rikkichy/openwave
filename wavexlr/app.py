@@ -13,7 +13,8 @@ import threading
 from .device import WaveXLR
 from .mixer import Mixer
 from .mixmatrix import MixMatrix
-from . import setup, service
+from .sourcedialog import AddSourceDialog
+from . import setup, service, sources as sources_module
 
 logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s")
 
@@ -28,14 +29,18 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         self._updating_ui = False
         self._last_state = None
         self._poll_id = None
+        self._stream_poll_id = None
         self._gain_timeout = None
         self._hp_timeout = None
+        self._sources = sources_module.load()
 
         self._build_ui()
         self._update_service_status()
         self.mixer = Mixer()
+        self.mixer.set_sources(self._sources)
         self.mixer.start()
         self._wire_matrix_cells()
+        self._start_stream_poll()
         self._try_connect()
 
     def _build_ui(self):
@@ -108,6 +113,17 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         )
         self.mic_source.connect("volume-changed", self._on_mic_matrix_volume_changed)
         self.mic_source.connect("mute-toggled", self._on_mic_matrix_mute_toggled)
+
+        # User-defined app sources (persisted)
+        for source_id, source in self._sources.items():
+            self.matrix.add_source(
+                source_id,
+                name=source.get("name", source_id),
+                icon_name=source.get("icon_name", "applications-multimedia-symbolic"),
+                has_level=False,
+            )
+
+        self.matrix.connect("add-source-clicked", self._on_add_source_clicked)
 
         # --- Sidebar: device controls -----------------------------------------
         sidebar_scroll = Gtk.ScrolledWindow(
@@ -415,15 +431,52 @@ class WaveXLRWindow(Adw.ApplicationWindow):
 
     def _wire_matrix_cells(self):
         """Bind each per-cell slider/mute to the mixer + restore persisted levels."""
-        for mix_id in ("personal", "chat", "record"):
-            cell = self.matrix.cell("mic", mix_id)
-            if cell is None:
-                continue
-            state = self.mixer.get_cell("mic", mix_id)
-            cell.set_volume(state["volume"])
-            cell.set_muted(state["muted"])
-            cell.connect("volume-changed", self._on_cell_volume_changed, "mic", mix_id)
-            cell.connect("mute-toggled", self._on_cell_mute_toggled, "mic", mix_id)
+        source_ids = ["mic"] + list(self._sources.keys())
+        for source_id in source_ids:
+            for mix_id in ("personal", "chat", "record"):
+                self._wire_cell(source_id, mix_id)
+
+    def _wire_cell(self, source_id, mix_id):
+        cell = self.matrix.cell(source_id, mix_id)
+        if cell is None:
+            return
+        state = self.mixer.get_cell(source_id, mix_id)
+        cell.set_volume(state["volume"])
+        cell.set_muted(state["muted"])
+        cell.connect("volume-changed", self._on_cell_volume_changed, source_id, mix_id)
+        cell.connect("mute-toggled", self._on_cell_mute_toggled, source_id, mix_id)
+
+    def _start_stream_poll(self):
+        """Poll for new/vanished PipeWire output streams every 2 s."""
+        if self._stream_poll_id:
+            GLib.source_remove(self._stream_poll_id)
+        self._stream_poll_id = GLib.timeout_add_seconds(2, self._stream_poll_tick)
+
+    def _stream_poll_tick(self):
+        self.mixer.poll_streams()
+        return True
+
+    def _on_add_source_clicked(self, _matrix):
+        dialog = AddSourceDialog()
+        dialog.connect("source-confirmed", self._on_source_confirmed)
+        dialog.present(self)
+
+    def _on_source_confirmed(self, _dialog, name, match_app_name):
+        source = sources_module.new_source(
+            name=name, match_app_name=match_app_name,
+        )
+        self._sources = sources_module.add(self._sources, source)
+        self.matrix.add_source(
+            source["id"],
+            name=source["name"],
+            icon_name=source["icon_name"],
+            has_level=False,
+        )
+        self._wire_cell(source["id"], "personal")
+        self._wire_cell(source["id"], "chat")
+        self._wire_cell(source["id"], "record")
+        self.mixer.set_sources(self._sources)
+        self.mixer.poll_streams()
 
     def _on_cell_volume_changed(self, _cell, value, source_id, mix_id):
         cur = self.mixer.get_cell(source_id, mix_id)

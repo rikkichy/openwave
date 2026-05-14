@@ -88,6 +88,41 @@ def _wpctl(*args):
         pass
 
 
+def list_audio_streams():
+    """Return [{id, app_name, media_name, node_name}, ...] for active output streams."""
+    import json as _json
+    try:
+        r = subprocess.run(
+            ["pw-dump"], capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode != 0:
+            return []
+        objects = _json.loads(r.stdout)
+    except (FileNotFoundError, subprocess.SubprocessError, _json.JSONDecodeError):
+        return []
+
+    out = []
+    for obj in objects:
+        if obj.get("type") != "PipeWire:Interface:Node":
+            continue
+        props = (obj.get("info") or {}).get("props") or {}
+        if props.get("media.class") != "Stream/Output/Audio":
+            continue
+        app = props.get("application.name") or props.get("node.name") or "Unknown"
+        # Skip our own loopbacks
+        node_name = props.get("node.name", "")
+        if node_name.startswith("openwave_"):
+            continue
+        out.append({
+            "id": obj["id"],
+            "app_name": app,
+            "media_name": props.get("media.name", ""),
+            "node_name": node_name,
+            "binary": props.get("application.process.binary", ""),
+        })
+    return out
+
+
 class Mixer:
     """Manages pw-loopback subprocesses for the matrix's mic row."""
 
@@ -95,6 +130,8 @@ class Mixer:
         self._lock = Lock()
         self._procs = {}
         self._state = self._load_state()
+        self._sources = {}
+        self._streams = {}
         self.mic, self.hp = find_wave_xlr_alsa()
 
     # ----- persistence -----
@@ -150,20 +187,14 @@ class Mixer:
 
     # ----- public API -----
     def start(self):
-        """Spawn the always-on Personal Mix → HP loopback and restore non-zero cells."""
+        """Spawn always-on Personal→HP loopback, snapshot streams, restore cells."""
         with self._lock:
             if self.hp:
                 self._spawn_loopback(
                     HP_LOOPBACK_KEY, PERSONAL_MIX_SINK, self.hp, HP_LOOPBACK_NODE,
                 )
-            for cell_key, state in list(self._state.items()):
-                source_id, _, mix_id = cell_key.partition(".")
-                if not mix_id:
-                    continue
-                self._apply_cell(
-                    source_id, mix_id,
-                    state.get("volume", 0.0), state.get("muted", False),
-                )
+            self._streams = {s["id"]: s for s in list_audio_streams()}
+            self._reconcile_all()
 
     def stop(self):
         with self._lock:
@@ -177,28 +208,90 @@ class Mixer:
                 "volume": volume, "muted": bool(muted),
             }
             self._save_state()
-            self._apply_cell(source_id, mix_id, volume, muted)
+            self._reconcile_cell(source_id, mix_id)
+
+    def set_sources(self, sources):
+        """Update the app-source configuration; reconciles loopbacks."""
+        with self._lock:
+            self._sources = dict(sources)
+            self._reconcile_all()
+
+    def poll_streams(self):
+        """Refresh the active-stream cache and adjust loopbacks. Returns the
+        diff (added, removed) of stream ids for the caller's bookkeeping."""
+        new = {s["id"]: s for s in list_audio_streams()}
+        with self._lock:
+            added = set(new) - set(self._streams)
+            removed = set(self._streams) - set(new)
+            self._streams = new
+            if added or removed:
+                self._reconcile_all()
+        return added, removed
 
     # ----- internal -----
-    def _apply_cell(self, source_id, mix_id, volume, muted):
-        # Phase 2b: only the mic source is wired.
-        if source_id != "mic" or not self.mic:
+    def _reconcile_all(self):
+        for source_id in (["mic"] + list(self._sources.keys())):
+            for mix_id in MIX_SINKS:
+                self._reconcile_cell(source_id, mix_id)
+
+    def _reconcile_cell(self, source_id, mix_id):
+        state = self._state.get(
+            f"{source_id}.{mix_id}", {"volume": 0.0, "muted": False}
+        )
+        if source_id == "mic":
+            self._reconcile_mic_cell(mix_id, state["volume"], state["muted"])
+        else:
+            self._reconcile_app_cell(source_id, mix_id, state["volume"], state["muted"])
+
+    def _reconcile_mic_cell(self, mix_id, volume, muted):
+        if not self.mic:
             return
         mix_sink = MIX_SINKS.get(mix_id)
         if not mix_sink:
             return
-        key = (source_id, mix_id)
-        node_name = f"openwave_loop_{source_id}_to_{mix_id}"
-
+        key = ("mic", mix_id)
+        node_name = f"openwave_loop_mic_to_{mix_id}"
         if volume <= 0.0:
             self._destroy_loopback(key)
             return
-
         if key not in self._procs:
             self._spawn_loopback(key, self.mic, mix_sink, node_name)
-
         node_id = _node_id_by_name(node_name)
-        if node_id is None:
+        if node_id is not None:
+            _wpctl("set-volume", node_id, f"{volume:.3f}")
+            _wpctl("set-mute", node_id, "1" if muted else "0")
+
+    def _reconcile_app_cell(self, source_id, mix_id, volume, muted):
+        source = self._sources.get(source_id)
+        if not source:
             return
-        _wpctl("set-volume", node_id, f"{volume:.3f}")
-        _wpctl("set-mute", node_id, "1" if muted else "0")
+        mix_sink = MIX_SINKS.get(mix_id)
+        if not mix_sink:
+            return
+        match = source.get("match_app_name")
+        matching_stream_ids = {
+            sid for sid, s in self._streams.items() if s.get("app_name") == match
+        }
+        existing_keys = {
+            k for k in self._procs
+            if len(k) == 3 and k[0] == source_id and k[1] == mix_id
+        }
+
+        # Tear down loopbacks for streams that vanished or for a zeroed cell
+        for k in list(existing_keys):
+            if volume <= 0.0 or k[2] not in matching_stream_ids:
+                self._destroy_loopback(k)
+
+        if volume <= 0.0:
+            return
+
+        # Spawn (or update volume on) loopbacks for each currently-matching stream
+        for stream_id in matching_stream_ids:
+            key = (source_id, mix_id, stream_id)
+            node_name = f"openwave_loop_{source_id}_{mix_id}_{stream_id}"
+            if key not in self._procs:
+                self._spawn_loopback(key, str(stream_id), mix_sink, node_name)
+            node_id = _node_id_by_name(node_name)
+            if node_id is not None:
+                _wpctl("set-volume", node_id, f"{volume:.3f}")
+                _wpctl("set-mute", node_id, "1" if muted else "0")

@@ -15,6 +15,10 @@ from gi.repository import Gtk, Adw, GObject  # noqa: E402
 class MixMatrix(Gtk.Box):
     """Scrollable grid of source rows × mix columns."""
 
+    __gsignals__ = {
+        "add-source-clicked": (GObject.SignalFlags.RUN_FIRST, None, ()),
+    }
+
     def __init__(self):
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
         self.add_css_class("openwave-matrix")
@@ -23,15 +27,18 @@ class MixMatrix(Gtk.Box):
         scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         self.append(scroll)
 
+        wrapper = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        scroll.set_child(wrapper)
+
         self._grid = Gtk.Grid(
             row_spacing=6,
             column_spacing=6,
             margin_start=12,
             margin_end=12,
             margin_top=12,
-            margin_bottom=12,
+            margin_bottom=0,
         )
-        scroll.set_child(self._grid)
+        wrapper.append(self._grid)
 
         self._mix_ids = []
         self._source_ids = []
@@ -41,6 +48,21 @@ class MixMatrix(Gtk.Box):
         corner = Gtk.Box()
         corner.set_size_request(260, 64)
         self._grid.attach(corner, 0, 0, 1, 1)
+
+        # "+ Add Source" trailing affordance, lives below the grid
+        add_row = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL,
+            margin_start=12, margin_end=12, margin_bottom=12,
+        )
+        wrapper.append(add_row)
+        self._add_btn = Gtk.Button(
+            label="+ Add Source",
+            halign=Gtk.Align.START,
+        )
+        self._add_btn.add_css_class("openwave-add-source")
+        self._add_btn.set_size_request(260, -1)
+        self._add_btn.connect("clicked", lambda _: self.emit("add-source-clicked"))
+        add_row.append(self._add_btn)
 
     def add_mix(self, mix_id, *, title, subtitle, icon_name):
         col = len(self._mix_ids) + 1
