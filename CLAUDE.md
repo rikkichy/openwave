@@ -27,6 +27,7 @@ wavexlr/
   service.py    — systemd / runit / stub backends; install via pkexec
   setup.py      — first-run: udev rule, WirePlumber rule, mix sinks, service
   mixer.py      — pw-loopback subprocess manager (the matrix's plumbing)
+  meter.py      — pw-cat-based level metering (one subprocess per metered source)
   mixmatrix.py  — GTK4 matrix grid (sources × mixes), SourceCell + MixCell
   sources.py    — load/save ~/.config/openwave/sources.json
   sourcedialog.py — two-page Add Source dialog (app picker → name + icon)
@@ -103,6 +104,30 @@ guard against this in `mixer.py`:
 Plus defensive exception handling in `_destroy_loopback` so one
 already-dead child can't abort iteration in `stop()`.
 
+## Level metering
+
+`wavexlr/meter.py::MeterMonitor` spawns one `pw-cat --record --rate 8000
+--channels 1 --format s16 -` per metered source. A daemon thread reads the
+binary stream in `CHUNK_BYTES` chunks (~16 ms each), `struct.unpack`s the
+samples, takes `max(abs(...)) / 32768`, and pushes the peak to GTK via
+`GLib.idle_add` (~60 Hz). The level lands in `SourceCell._level`, a
+`Gtk.LevelBar` in CONTINUOUS mode with offsets at 0.7 / 0.9 / 1.0 for
+green / amber / red.
+
+The meter retargets per source on every stream-poll tick (2 s) via
+`_refresh_app_meter`: if the bound app gains or loses its currently-metered
+stream id, the meter restarts on a fresh stream (or stops and zeroes the
+bar). Mic meter is started once at window init and runs for the life of
+the GUI.
+
+`pw-cat --quiet` does **not** exist on this PipeWire build. pw-cat is
+non-verbose by default; do not re-add `--quiet` or the subprocess will
+exit immediately and the meter will silently stop producing samples.
+
+`pw-cat` children get the same `PR_SET_PDEATHSIG` `preexec_fn` as
+loopbacks via `from .mixer import _set_pdeathsig`, plus `meter.stop_all()`
+on app shutdown.
+
 ## Slider snap-to-0
 
 `Gtk.Scale` is continuous; dragging back to "visually 0" usually lands at
@@ -155,6 +180,10 @@ log/run scripts as a here-doc into a pkexec sh wrapper
 - **Phase 3b** — Two-page dialog: pick app → name + icon (12 symbolic
   icons in a `Gtk.FlowBox`). × remove button on app source rows via
   `Gtk.Grid.remove_row`.
+- **Phase 4** — Live level meters: `wavexlr/meter.py` + `Gtk.LevelBar`
+  on every source row. Mic meter runs continuously; app source meters
+  follow their currently-matching PipeWire stream and stop/zero when
+  no match is active.
 
 ## Decisions deliberately rejected — don't re-propose
 
@@ -172,6 +201,11 @@ log/run scripts as a here-doc into a pkexec sh wrapper
   12-icon FlowBox covers the common cases without `.desktop` parsing
   fragility (Snap/Flatpak naming, missing files, hicolor lookups). If a
   user wants a fancier icon, they edit `sources.json` by hand for now.
+- **Native PipeWire bindings for metering** (`pipewire-python`,
+  `pulsectl`, custom ctypes shim). The pw-cat subprocess approach costs
+  ~16 KB/s of pipe I/O per meter and is bulletproof across PW versions;
+  adding a Python binding is a maintenance burden disproportionate to
+  the saving.
 
 ## Things worth knowing that aren't obvious from the code
 
