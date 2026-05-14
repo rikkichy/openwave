@@ -204,6 +204,7 @@ class SourceCell(Gtk.Box):
                 lower=0.0, upper=1.0, step_increment=0.01, page_increment=0.05
             ),
             valign=Gtk.Align.CENTER,
+            round_digits=2,
         )
         self._scale.add_css_class("openwave-mix-slider")
         self._scale.set_size_request(110, -1)
@@ -304,6 +305,7 @@ class MixCell(Gtk.Box):
             ),
             valign=Gtk.Align.CENTER,
             hexpand=True,
+            round_digits=2,
         )
         self._scale.add_css_class("openwave-mix-slider")
         self._scale_handler = self._scale.connect("value-changed", self._on_value_changed)

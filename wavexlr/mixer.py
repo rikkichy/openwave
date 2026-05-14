@@ -218,8 +218,14 @@ class Mixer:
             for key in list(self._procs.keys()):
                 self._destroy_loopback(key)
 
+    # Below this, the slider snaps to 0 — sub-1% values keep the loopback alive
+    # at imperceptible-but-not-silent volume and confuse "I put it back to 0".
+    _ZERO_THRESHOLD = 0.01
+
     def set_cell(self, source_id, mix_id, volume, muted):
         volume = max(0.0, min(1.0, float(volume)))
+        if volume < self._ZERO_THRESHOLD:
+            volume = 0.0
         with self._lock:
             self._state[f"{source_id}.{mix_id}"] = {
                 "volume": volume, "muted": bool(muted),
