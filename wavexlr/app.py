@@ -4,24 +4,31 @@ import gi
 gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
 
-from gi.repository import Gtk, Adw, GLib, Gio
+from gi.repository import Gtk, Adw, GLib, Gio, Gdk
 import logging
+import os
 import sys
 import threading
 
 from .device import WaveXLR
+from .mixmatrix import MixMatrix
 from . import setup, service
 
 logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s")
 
+GAIN_MAX = 0x5000
+
 
 class WaveXLRWindow(Adw.ApplicationWindow):
     def __init__(self, **kwargs):
-        super().__init__(**kwargs, title="OpenWave", default_width=380, default_height=560)
+        super().__init__(**kwargs, title="OpenWave", default_width=1100, default_height=620)
+        self.set_size_request(900, 520)
         self.xlr = WaveXLR()
         self._updating_ui = False
         self._last_state = None
         self._poll_id = None
+        self._gain_timeout = None
+        self._hp_timeout = None
 
         self._build_ui()
         self._update_service_status()
@@ -37,25 +44,68 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         self.status_label.add_css_class("dim-label")
         header.set_title_widget(self.status_label)
 
-        # Refresh button
         refresh_btn = Gtk.Button(icon_name="view-refresh-symbolic", tooltip_text="Reconnect")
         refresh_btn.connect("clicked", lambda _: self._try_connect())
         header.pack_end(refresh_btn)
         box.append(header)
 
-        # Scrollable content
-        scroll = Gtk.ScrolledWindow(vexpand=True)
-        box.append(scroll)
+        # Two-pane split: matrix (left) | device controls (right)
+        panes = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, vexpand=True)
+        box.append(panes)
 
-        clamp = Adw.Clamp(maximum_size=600, margin_start=12, margin_end=12, margin_top=12, margin_bottom=12)
-        scroll.set_child(clamp)
+        # --- Left pane: mix matrix --------------------------------------------
+        self.matrix = MixMatrix()
+        self.matrix.set_hexpand(True)
+        panes.append(self.matrix)
 
-        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        clamp.set_child(content)
+        self.matrix.add_mix(
+            "personal", title="Personal Mix",
+            subtitle="What you hear",
+            icon_name="audio-headphones-symbolic",
+        )
+        self.matrix.add_mix(
+            "chat", title="Chat Mix",
+            subtitle="To voice apps (v0.3.0)",
+            icon_name="system-users-symbolic",
+        )
+        self.matrix.add_mix(
+            "record", title="Record Mix",
+            subtitle="To OBS / recording (v0.3.0)",
+            icon_name="media-record-symbolic",
+        )
 
+        self.mic_source = self.matrix.add_source(
+            "mic", name="Wave XLR",
+            icon_name="audio-input-microphone-symbolic",
+            has_level=True,
+        )
+        self.mic_source.connect("volume-changed", self._on_mic_matrix_volume_changed)
+        self.mic_source.connect("mute-toggled", self._on_mic_matrix_mute_toggled)
+
+        # --- Vertical separator -----------------------------------------------
+        panes.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
+
+        # --- Right pane: device controls --------------------------------------
+        right_scroll = Gtk.ScrolledWindow(vexpand=True)
+        right_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        right_scroll.set_size_request(360, -1)
+        panes.append(right_scroll)
+
+        right_clamp = Adw.Clamp(
+            maximum_size=360,
+            margin_start=12, margin_end=12, margin_top=12, margin_bottom=12,
+        )
+        right_scroll.set_child(right_clamp)
+
+        right_content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        right_clamp.set_child(right_content)
+        self._build_device_pane(right_content)
+
+    def _build_device_pane(self, parent):
+        """Populate the right-hand column with Audio / Mic / HP / Device Info groups."""
         # --- Audio fix status ---
         status_group = Adw.PreferencesGroup(title="Audio")
-        content.append(status_group)
+        parent.append(status_group)
 
         self.audio_status_row = Adw.ActionRow(
             title="Capture Fix",
@@ -74,15 +124,13 @@ class WaveXLRWindow(Adw.ApplicationWindow):
 
         # --- Mic controls ---
         mic_group = Adw.PreferencesGroup(title="Microphone")
-        content.append(mic_group)
+        parent.append(mic_group)
 
-        # Mute
         mute_row = Adw.SwitchRow(title="Mute", subtitle="Toggle microphone mute")
         mute_row.connect("notify::active", self._on_mute_changed)
         self.mute_row = mute_row
         mic_group.add(mute_row)
 
-        # Gain
         gain_row = Adw.ActionRow(title="Gain")
         self.gain_label = Gtk.Label(label="0x0000", width_chars=8, xalign=1)
         self.gain_label.add_css_class("monospace")
@@ -98,9 +146,8 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         self.gain_scale.set_margin_start(12)
         self.gain_scale.set_margin_end(12)
         self.gain_scale.connect("value-changed", self._on_gain_changed)
-        content.append(self.gain_scale)
+        parent.append(self.gain_scale)
 
-        # Knob mode indicator
         knob_row = Adw.ActionRow(title="Knob Controls", subtitle="What the physical knob adjusts")
         self.knob_label = Gtk.Label(label="Gain")
         self.knob_label.add_css_class("dim-label")
@@ -109,9 +156,8 @@ class WaveXLRWindow(Adw.ApplicationWindow):
 
         # --- Headphone controls ---
         hp_group = Adw.PreferencesGroup(title="Headphones")
-        content.append(hp_group)
+        parent.append(hp_group)
 
-        # HP Volume
         hp_vol_row = Adw.ActionRow(title="Volume")
         self.hp_label = Gtk.Label(label="0.0 dB", width_chars=10, xalign=1)
         self.hp_label.add_css_class("monospace")
@@ -127,9 +173,8 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         self.hp_scale.set_margin_start(12)
         self.hp_scale.set_margin_end(12)
         self.hp_scale.connect("value-changed", self._on_hp_changed)
-        content.append(self.hp_scale)
+        parent.append(self.hp_scale)
 
-        # Low impedance
         lowz_row = Adw.SwitchRow(title="Low Impedance", subtitle="For low impedance headphones")
         lowz_row.connect("notify::active", self._on_lowz_changed)
         self.lowz_row = lowz_row
@@ -137,7 +182,7 @@ class WaveXLRWindow(Adw.ApplicationWindow):
 
         # --- Device info ---
         info_group = Adw.PreferencesGroup(title="Device Info")
-        content.append(info_group)
+        parent.append(info_group)
 
         self.fw_row = Adw.ActionRow(title="Firmware")
         self.fw_label = Gtk.Label(label="—")
@@ -271,6 +316,8 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         self.hp_label.set_label(f"{state['hp_volume_db']:.1f} dB")
         self.lowz_row.set_active(state["low_impedance"])
         self.knob_label.set_label("Headphones" if state["volume_select"] == "hp" else "Gain")
+        self.mic_source.set_volume(state["gain_raw"] / GAIN_MAX)
+        self.mic_source.set_muted(state["mute"])
         self._updating_ui = False
 
     def _on_usb_error(self, e):
@@ -320,6 +367,26 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         enabled = row.get_active()
         self._usb_async(lambda: self.xlr.set_low_impedance(enabled), on_error=self._on_usb_error)
 
+    def _on_mic_matrix_volume_changed(self, _source, value):
+        if self._updating_ui or not self.xlr.connected:
+            return
+        raw = int(value * GAIN_MAX)
+        self.gain_label.set_label(f"0x{raw:04X}")
+        self._updating_ui = True
+        self.gain_scale.set_value(raw)
+        self._updating_ui = False
+        if self._gain_timeout:
+            GLib.source_remove(self._gain_timeout)
+        self._gain_timeout = GLib.timeout_add(200, self._send_gain, raw)
+
+    def _on_mic_matrix_mute_toggled(self, _source, muted):
+        if self._updating_ui or not self.xlr.connected:
+            return
+        self._updating_ui = True
+        self.mute_row.set_active(muted)
+        self._updating_ui = False
+        self._usb_async(lambda: self.xlr.set_mute(muted), on_error=self._on_usb_error)
+
 
 class WaveXLRApp(Adw.Application):
     def __init__(self):
@@ -344,6 +411,7 @@ class WaveXLRApp(Adw.Application):
 
     def do_activate(self):
         if not self._window:
+            self._load_css()
             if setup.needs_setup():
                 self._show_setup_dialog()
                 return
@@ -355,6 +423,24 @@ class WaveXLRApp(Adw.Application):
                 self._start_hidden = False  # only first launch
                 return
         self._window.present()
+
+    def _load_css(self):
+        """Load OpenWave's stylesheet — alongside the .py files, or under share/."""
+        candidates = (
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "style.css"),
+            "/usr/local/share/openwave/style.css",
+            "/usr/share/openwave/style.css",
+        )
+        css_path = next((p for p in candidates if os.path.exists(p)), None)
+        if css_path is None:
+            return
+        provider = Gtk.CssProvider()
+        provider.load_from_path(css_path)
+        display = Gdk.Display.get_default()
+        if display is not None:
+            Gtk.StyleContext.add_provider_for_display(
+                display, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+            )
 
     def _on_close_request(self, window):
         if self._tray:

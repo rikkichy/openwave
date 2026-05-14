@@ -17,6 +17,7 @@ package() {
     local site=$(python3 -c "import site; print(site.getsitepackages()[0])")
     install -dm755 "$pkgdir$site/wavexlr"
     install -Dm644 wavexlr/*.py "$pkgdir$site/wavexlr/"
+    install -Dm644 wavexlr/style.css "$pkgdir$site/wavexlr/style.css"
 
     # Launcher script
     install -dm755 "$pkgdir/usr/bin"

@@ -1,0 +1,37 @@
+.openwave-mix-slider trough {
+    min-height: 8px;
+    background-color: alpha(@card_fg_color, 0.12);
+    border-radius: 4px;
+}
+
+.openwave-mix-slider highlight {
+    background-color: #4ade80;
+    border-radius: 4px;
+}
+
+.openwave-mix-slider:disabled highlight {
+    background-color: alpha(#4ade80, 0.35);
+}
+
+.openwave-mix-slider slider {
+    min-width: 14px;
+    min-height: 14px;
+    background-color: #3b82f6;
+    border: 2px solid alpha(black, 0.35);
+    border-radius: 50%;
+    box-shadow: 0 1px 2px alpha(black, 0.4);
+}
+
+.openwave-mix-slider:disabled slider {
+    background-color: alpha(#3b82f6, 0.5);
+}
+
+.openwave-mix-header,
+.openwave-source-cell,
+.openwave-mix-cell {
+    border-radius: 10px;
+}
+
+.openwave-mix-cell:disabled {
+    opacity: 0.55;
+}
