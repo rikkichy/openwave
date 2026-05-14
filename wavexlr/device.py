@@ -105,9 +105,12 @@ def _alsa_set_hp_vol(card, value):
 
 
 def _fw_hp_to_alsa(fw_hp_raw):
-    """Map firmware HP (int16 Q8.8, -7808 to 0) to ALSA (0-120)."""
-    # Firmware: -7808 (-30.5dB) to 0 (0dB), ALSA: 0 (-60dB) to 120 (0dB)
-    # ALSA step = 0.5 dB, so dB = (value - 120) * 0.5 → value = dB / 0.5 + 120
+    """Map firmware HP to ALSA (0-120).
+
+    Firmware: int16 Q8.8, range -32768 (-128 dB) to 0 (0 dB).
+    ALSA driver caps lower at 0 → -60 dB; anything below saturates.
+    ALSA step = 0.5 dB, so dB = (value - 120) * 0.5 → value = dB / 0.5 + 120.
+    """
     db = fw_hp_raw / 256.0
     return max(0, min(120, round(db / 0.5 + 120)))
 
@@ -115,7 +118,7 @@ def _fw_hp_to_alsa(fw_hp_raw):
 def _alsa_hp_to_fw(alsa_hp):
     """Map ALSA HP (0-120) to firmware HP (int16 Q8.8)."""
     db = (alsa_hp - 120) * 0.5  # 0→-60, 120→0
-    db = max(-30.5, min(0.0, db))  # clamp to firmware range
+    db = max(-128.0, min(0.0, db))  # firmware range
     return int(db * 256)
 
 
@@ -279,7 +282,7 @@ class WaveXLR:
             _alsa_set_mute(self._card, muted)
 
     def set_hp_volume_db(self, db):
-        db = max(-30.5, min(0.0, db))
+        db = max(-128.0, min(0.0, db))
         raw = int(db * 256)
         config = self.read_config()
         struct.pack_into('<h', config, OFF_HP_VOL, raw)
