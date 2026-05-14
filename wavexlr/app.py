@@ -121,9 +121,11 @@ class WaveXLRWindow(Adw.ApplicationWindow):
                 name=source.get("name", source_id),
                 icon_name=source.get("icon_name", "applications-multimedia-symbolic"),
                 has_level=False,
+                removable=True,
             )
 
         self.matrix.connect("add-source-clicked", self._on_add_source_clicked)
+        self.matrix.connect("remove-source-clicked", self._on_remove_source_clicked)
 
         # --- Sidebar: device controls -----------------------------------------
         sidebar_scroll = Gtk.ScrolledWindow(
@@ -461,9 +463,9 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         dialog.connect("source-confirmed", self._on_source_confirmed)
         dialog.present(self)
 
-    def _on_source_confirmed(self, _dialog, name, match_app_name):
+    def _on_source_confirmed(self, _dialog, name, match_app_name, icon_name):
         source = sources_module.new_source(
-            name=name, match_app_name=match_app_name,
+            name=name, match_app_name=match_app_name, icon_name=icon_name,
         )
         self._sources = sources_module.add(self._sources, source)
         self.matrix.add_source(
@@ -471,12 +473,34 @@ class WaveXLRWindow(Adw.ApplicationWindow):
             name=source["name"],
             icon_name=source["icon_name"],
             has_level=False,
+            removable=True,
         )
         self._wire_cell(source["id"], "personal")
         self._wire_cell(source["id"], "chat")
         self._wire_cell(source["id"], "record")
         self.mixer.set_sources(self._sources)
         self.mixer.poll_streams()
+
+    def _on_remove_source_clicked(self, _matrix, source_id):
+        source = self._sources.get(source_id, {})
+        name = source.get("name", "this source")
+        dialog = Adw.AlertDialog(
+            heading="Remove source?",
+            body=f"This deletes “{name}” and its mix levels. The bound application "
+                 f"itself is not affected.",
+        )
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("remove", "Remove")
+        dialog.set_response_appearance("remove", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_default_response("cancel")
+        dialog.choose(self, None, lambda d, r: self._on_remove_response(d, r, source_id))
+
+    def _on_remove_response(self, dialog, result, source_id):
+        if dialog.choose_finish(result) != "remove":
+            return
+        self.matrix.remove_source(source_id)
+        self._sources = sources_module.remove(self._sources, source_id)
+        self.mixer.remove_source(source_id)
 
     def _on_cell_volume_changed(self, _cell, value, source_id, mix_id):
         cur = self.mixer.get_cell(source_id, mix_id)

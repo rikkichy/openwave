@@ -17,6 +17,7 @@ class MixMatrix(Gtk.Box):
 
     __gsignals__ = {
         "add-source-clicked": (GObject.SignalFlags.RUN_FIRST, None, ()),
+        "remove-source-clicked": (GObject.SignalFlags.RUN_FIRST, None, (str,)),
     }
 
     def __init__(self):
@@ -70,9 +71,17 @@ class MixMatrix(Gtk.Box):
         self._grid.attach(header, col, 0, 1, 1)
         self._mix_ids.append(mix_id)
 
-    def add_source(self, source_id, *, name, icon_name, has_level=False):
+    def add_source(self, source_id, *, name, icon_name, has_level=False, removable=False):
         row = len(self._source_ids) + 1
-        source = SourceCell(name=name, icon_name=icon_name, has_level=has_level)
+        source = SourceCell(
+            name=name, icon_name=icon_name,
+            has_level=has_level, removable=removable,
+        )
+        if removable:
+            source.connect(
+                "remove-clicked",
+                lambda _s, sid=source_id: self.emit("remove-source-clicked", sid),
+            )
         self._grid.attach(source, 0, row, 1, 1)
         self._sources[source_id] = source
         self._source_ids.append(source_id)
@@ -83,6 +92,16 @@ class MixMatrix(Gtk.Box):
             self._cells[(source_id, mix_id)] = cell
 
         return source
+
+    def remove_source(self, source_id):
+        if source_id not in self._source_ids:
+            return
+        idx = self._source_ids.index(source_id)
+        self._grid.remove_row(idx + 1)
+        self._source_ids.pop(idx)
+        self._sources.pop(source_id, None)
+        for mix_id in self._mix_ids:
+            self._cells.pop((source_id, mix_id), None)
 
     def source(self, source_id):
         return self._sources.get(source_id)
@@ -139,9 +158,10 @@ class SourceCell(Gtk.Box):
     __gsignals__ = {
         "volume-changed": (GObject.SignalFlags.RUN_FIRST, None, (float,)),
         "mute-toggled": (GObject.SignalFlags.RUN_FIRST, None, (bool,)),
+        "remove-clicked": (GObject.SignalFlags.RUN_FIRST, None, ()),
     }
 
-    def __init__(self, *, name, icon_name, has_level):
+    def __init__(self, *, name, icon_name, has_level, removable=False):
         super().__init__(
             orientation=Gtk.Orientation.HORIZONTAL,
             spacing=10,
@@ -196,6 +216,17 @@ class SourceCell(Gtk.Box):
             self._level.add_css_class("success")
             self._level.set_valign(Gtk.Align.CENTER)
             inner.append(self._level)
+
+        if removable:
+            remove_btn = Gtk.Button(
+                icon_name="window-close-symbolic",
+                valign=Gtk.Align.CENTER,
+                tooltip_text="Remove source",
+            )
+            remove_btn.add_css_class("flat")
+            remove_btn.add_css_class("circular")
+            remove_btn.connect("clicked", lambda _: self.emit("remove-clicked"))
+            inner.append(remove_btn)
 
     def set_volume(self, value):
         """Update the master slider without firing the changed signal."""

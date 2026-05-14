@@ -216,6 +216,18 @@ class Mixer:
             self._sources = dict(sources)
             self._reconcile_all()
 
+    def remove_source(self, source_id):
+        """Tear down all loopbacks for a source and forget its persisted cells."""
+        with self._lock:
+            for key in list(self._procs.keys()):
+                if isinstance(key, tuple) and key and key[0] == source_id:
+                    self._destroy_loopback(key)
+            prefix = f"{source_id}."
+            for cell_key in [k for k in self._state if k.startswith(prefix)]:
+                del self._state[cell_key]
+            self._save_state()
+            self._sources.pop(source_id, None)
+
     def poll_streams(self):
         """Refresh the active-stream cache and adjust loopbacks. Returns the
         diff (added, removed) of stream ids for the caller's bookkeeping."""
