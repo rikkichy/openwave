@@ -187,7 +187,13 @@ class Mixer:
 
     # ----- public API -----
     def start(self):
-        """Spawn always-on Personal→HP loopback, snapshot streams, restore cells."""
+        """Spawn always-on Personal→HP loopback, snapshot streams, restore cells.
+
+        First, sweep stale pw-loopback children from prior runs that didn't shut
+        down cleanly (kill -9, crash, log-out before atexit) — without this they
+        accumulate across launches and silently produce audio feedback.
+        """
+        self._sweep_stale_loopbacks()
         with self._lock:
             if self.hp:
                 self._spawn_loopback(
@@ -195,6 +201,17 @@ class Mixer:
                 )
             self._streams = {s["id"]: s for s in list_audio_streams()}
             self._reconcile_all()
+
+    @staticmethod
+    def _sweep_stale_loopbacks():
+        try:
+            subprocess.run(
+                ["pkill", "-f", "pw-loopback.*openwave_loop_"],
+                capture_output=True, timeout=2,
+            )
+        except (FileNotFoundError, subprocess.SubprocessError):
+            return
+        time.sleep(0.2)  # give the kernel a beat to reap so we don't race
 
     def stop(self):
         with self._lock:
