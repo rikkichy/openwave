@@ -57,10 +57,6 @@ class MixMatrix(Gtk.Box):
 
         for col_idx, mix_id in enumerate(self._mix_ids):
             cell = MixCell()
-            cell.set_sensitive(False)
-            cell.set_tooltip_text(
-                "Per-mix routing arrives in v0.3.0 with the PipeWire backend"
-            )
             self._grid.attach(cell, col_idx + 1, row, 1, 1)
             self._cells[(source_id, mix_id)] = cell
 
@@ -68,6 +64,9 @@ class MixMatrix(Gtk.Box):
 
     def source(self, source_id):
         return self._sources.get(source_id)
+
+    def cell(self, source_id, mix_id):
+        return self._cells.get((source_id, mix_id))
 
 
 class MixHeaderCell(Gtk.Box):
@@ -211,6 +210,11 @@ class SourceCell(Gtk.Box):
 class MixCell(Gtk.Box):
     """Grid intersection: small mute toggle + horizontal volume slider."""
 
+    __gsignals__ = {
+        "volume-changed": (GObject.SignalFlags.RUN_FIRST, None, (float,)),
+        "mute-toggled": (GObject.SignalFlags.RUN_FIRST, None, (bool,)),
+    }
+
     def __init__(self):
         super().__init__(
             orientation=Gtk.Orientation.HORIZONTAL,
@@ -234,7 +238,9 @@ class MixCell(Gtk.Box):
         self._mute_btn = Gtk.ToggleButton(valign=Gtk.Align.CENTER)
         self._mute_btn.add_css_class("flat")
         self._mute_btn.add_css_class("circular")
-        self._mute_btn.set_child(Gtk.Image.new_from_icon_name("audio-volume-high-symbolic"))
+        self._mute_icon = Gtk.Image.new_from_icon_name("audio-volume-high-symbolic")
+        self._mute_btn.set_child(self._mute_icon)
+        self._mute_handler = self._mute_btn.connect("toggled", self._on_mute_toggled)
         inner.append(self._mute_btn)
 
         self._scale = Gtk.Scale(
@@ -247,5 +253,26 @@ class MixCell(Gtk.Box):
             hexpand=True,
         )
         self._scale.add_css_class("openwave-mix-slider")
-        self._scale.set_value(0.5)
+        self._scale_handler = self._scale.connect("value-changed", self._on_value_changed)
         inner.append(self._scale)
+
+    def set_volume(self, value):
+        with GObject.signal_handler_block(self._scale, self._scale_handler):
+            self._scale.set_value(max(0.0, min(1.0, value)))
+
+    def set_muted(self, muted):
+        with GObject.signal_handler_block(self._mute_btn, self._mute_handler):
+            self._mute_btn.set_active(muted)
+        self._mute_icon.set_from_icon_name(
+            "audio-volume-muted-symbolic" if muted else "audio-volume-high-symbolic"
+        )
+
+    def _on_value_changed(self, scale):
+        self.emit("volume-changed", scale.get_value())
+
+    def _on_mute_toggled(self, btn):
+        muted = btn.get_active()
+        self._mute_icon.set_from_icon_name(
+            "audio-volume-muted-symbolic" if muted else "audio-volume-high-symbolic"
+        )
+        self.emit("mute-toggled", muted)

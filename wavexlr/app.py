@@ -11,6 +11,7 @@ import sys
 import threading
 
 from .device import WaveXLR
+from .mixer import Mixer
 from .mixmatrix import MixMatrix
 from . import setup, service
 
@@ -32,6 +33,9 @@ class WaveXLRWindow(Adw.ApplicationWindow):
 
         self._build_ui()
         self._update_service_status()
+        self.mixer = Mixer()
+        self.mixer.start()
+        self._wire_matrix_cells()
         self._try_connect()
 
     def _build_ui(self):
@@ -409,6 +413,26 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         self._updating_ui = False
         self._usb_async(lambda: self.xlr.set_mute(muted), on_error=self._on_usb_error)
 
+    def _wire_matrix_cells(self):
+        """Bind each per-cell slider/mute to the mixer + restore persisted levels."""
+        for mix_id in ("personal", "chat", "record"):
+            cell = self.matrix.cell("mic", mix_id)
+            if cell is None:
+                continue
+            state = self.mixer.get_cell("mic", mix_id)
+            cell.set_volume(state["volume"])
+            cell.set_muted(state["muted"])
+            cell.connect("volume-changed", self._on_cell_volume_changed, "mic", mix_id)
+            cell.connect("mute-toggled", self._on_cell_mute_toggled, "mic", mix_id)
+
+    def _on_cell_volume_changed(self, _cell, value, source_id, mix_id):
+        cur = self.mixer.get_cell(source_id, mix_id)
+        self.mixer.set_cell(source_id, mix_id, value, cur["muted"])
+
+    def _on_cell_mute_toggled(self, _cell, muted, source_id, mix_id):
+        cur = self.mixer.get_cell(source_id, mix_id)
+        self.mixer.set_cell(source_id, mix_id, cur["volume"], muted)
+
 
 class WaveXLRApp(Adw.Application):
     def __init__(self):
@@ -463,6 +487,12 @@ class WaveXLRApp(Adw.Application):
             Gtk.StyleContext.add_provider_for_display(
                 display, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
             )
+
+    def do_shutdown(self):
+        """Tear down loopback subprocesses before the process exits."""
+        if self._window is not None and hasattr(self._window, "mixer"):
+            self._window.mixer.stop()
+        Adw.Application.do_shutdown(self)
 
     def _on_close_request(self, window):
         if self._tray:
