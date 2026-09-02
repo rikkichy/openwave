@@ -295,7 +295,6 @@ class WaveXLRWindow(Adw.ApplicationWindow):
             self.audio_status_icon.set_from_icon_name("emblem-ok-symbolic")
             self.audio_status_icon.remove_css_class("dim-label")
             self.audio_status_row.set_subtitle("Audio service running")
-            self.uninstall_btn.set_visible(True)
         else:
             self.audio_status_icon.set_from_icon_name("dialog-warning-symbolic")
             # Distinguish a service that never came up from one that is not
@@ -308,12 +307,19 @@ class WaveXLRWindow(Adw.ApplicationWindow):
             else:
                 subtitle = "Audio service not running"
             self.audio_status_row.set_subtitle(subtitle)
-            self.uninstall_btn.set_visible(False)
+
+        # Shown whenever there is something to remove, rather than only while
+        # the service runs. A stopped or failed service is when removing it
+        # matters most, and the udev rule and the config drop-ins outlive it
+        # either way.
+        self.uninstall_btn.set_visible(setup.anything_installed())
 
     def _on_uninstall_clicked(self, btn):
         dialog = Adw.AlertDialog(
             heading="Uninstall Capture Fix?",
-            body="This will remove the audio service and USB permissions.\n\nYou can reinstall them by restarting OpenWave.",
+            body="This will remove the audio service, the WirePlumber rule, "
+                 "the mix sinks and the USB permissions.\n\nYou can reinstall "
+                 "them by restarting OpenWave.",
         )
         dialog.add_response("cancel", "Cancel")
         dialog.add_response("uninstall", "Uninstall")

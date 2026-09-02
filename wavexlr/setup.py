@@ -87,6 +87,20 @@ def needs_setup():
     )
 
 
+def anything_installed():
+    """Whether any part of the integration is still on disk.
+
+    Not the inverse of needs_setup(): a partial install both needs setup and
+    has things left to remove.
+    """
+    return (
+        udev_installed()
+        or service_installed()
+        or wireplumber_installed()
+        or mixes_installed()
+    )
+
+
 def install_udev():
     """Install udev rules via pkexec."""
     rules = "\n".join(UDEV_RULES)
