@@ -42,10 +42,11 @@ class WaveXLRWindow(Adw.ApplicationWindow):
 
         self._build_ui()
         self._update_service_status()
-        self.mixer = Mixer()
+        # Meter first: the mixer's watchdog can fire as soon as it exists.
+        self.meter = MeterMonitor()
+        self.mixer = Mixer(on_devices_changed=self._on_devices_changed)
         self.mixer.set_sources(self._sources)
         self.mixer.start()
-        self.meter = MeterMonitor()
         self._meter_targets = {}
         self._wire_matrix_cells()
         self._start_meters()
@@ -539,13 +540,29 @@ class WaveXLRWindow(Adw.ApplicationWindow):
 
     def _start_meters(self):
         """Begin metering the mic + any app source that already has a matching stream."""
-        if self.mixer.mic:
-            self.meter.start(
-                "mic", self.mixer.mic,
-                lambda level: self._set_source_level("mic", level),
-            )
+        self._restart_mic_meter()
         for source_id in self._sources.keys():
             self._refresh_app_meter(source_id)
+
+    def _on_devices_changed(self):
+        """Called on the mixer's worker thread."""
+        GLib.idle_add(self._restart_mic_meter)
+
+    def _restart_mic_meter(self):
+        """Point the mic meter at whatever node the mic is on now.
+
+        pw-cat binds a node name at spawn, so a meter left on a destroyed node
+        reads flat zero, which looks the same as a dead mic.
+        """
+        mic = self.mixer.mic
+        if mic:
+            self.meter.start(
+                "mic", mic,
+                lambda level: self._set_source_level("mic", level),
+            )
+        else:
+            self.meter.stop("mic")
+        return False
 
     def _refresh_app_meter(self, source_id):
         """Re-point the meter at the first currently-matching stream, or stop it

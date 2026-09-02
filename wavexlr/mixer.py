@@ -7,6 +7,10 @@ playback node via wpctl.
 
 State is persisted to ~/.config/openwave/mixes.json so per-cell levels survive
 restarts (the loopbacks themselves do not — they're respawned by start()).
+
+PipeWire can destroy and recreate the nodes all of this is named after, and
+nothing announces it, so the worker re-checks device names and loopback
+liveness on a timer and rebuilds whatever no longer matches.
 """
 
 import atexit
@@ -47,6 +51,10 @@ MIX_SINKS = {
     "chat":     "openwave_chat_mix",
     "record":   "openwave_record_mix",
 }
+# How often the worker re-resolves the Wave's node names and checks its
+# loopbacks are alive. A recovery path, not a control one: nothing waits on it.
+DEVICE_RECHECK_INTERVAL = 5.0
+
 PERSONAL_MIX_SINK = "openwave_personal_mix"
 HP_LOOPBACK_KEY = "_personal_to_hp"
 HP_LOOPBACK_NODE = "openwave_loop_personal_to_hp"
@@ -168,13 +176,17 @@ def list_audio_streams():
 class Mixer:
     """Manages pw-loopback subprocesses for the matrix's mic row."""
 
-    def __init__(self):
+    def __init__(self, on_devices_changed=None):
         self._lock = Lock()
         self._procs = {}
         self._state = self._load_state()
         self._sources = {}
         self._streams = {}
         self.mic, self.hp = find_wave_xlr_alsa()
+
+        # Fired on the worker when mic/hp resolve to something different.
+        self.on_devices_changed = on_devices_changed
+        self._last_device_check = time.monotonic()
 
         # Background worker: every operation that talks to pw-loopback /
         # pw-cli / wpctl runs here so the GTK main thread never blocks on a
@@ -216,6 +228,76 @@ class Mixer:
                     _log.exception("mixer task failed: %s", key)
             if not self._worker_running:
                 return
+            self._device_watchdog()
+
+    # ----- device watchdog -----
+    def _device_watchdog(self):
+        """Re-check what the mixer is built on, and rebuild what moved."""
+        now = time.monotonic()
+        if now - self._last_device_check < DEVICE_RECHECK_INTERVAL:
+            return
+        self._last_device_check = now
+        try:
+            devices_changed = self._refresh_devices()
+            loopbacks_died = self._reap_dead_loopbacks()
+        except Exception:
+            _log.exception("device watchdog failed")
+            return
+        if devices_changed or loopbacks_died:
+            try:
+                self._reconcile_all()
+            except Exception:
+                _log.exception("watchdog reconcile failed")
+        if devices_changed and self.on_devices_changed is not None:
+            try:
+                self.on_devices_changed()
+            except Exception:
+                _log.exception("on_devices_changed callback failed")
+
+    def _refresh_devices(self):
+        """Re-resolve the Wave's node names. True if either moved.
+
+        A moved name leaves loopbacks wired to a node that no longer exists,
+        which liveness alone misses: the process is still running.
+        """
+        mic, hp = find_wave_xlr_alsa()
+        if (mic, hp) == (self.mic, self.hp):
+            return False
+        old_mic, old_hp = self.mic, self.hp
+        self.mic, self.hp = mic, hp
+        _log.info(
+            "Wave nodes moved: mic %s -> %s, hp %s -> %s", old_mic, mic, old_hp, hp,
+        )
+        if mic != old_mic:
+            for key in [
+                k for k in list(self._procs)
+                if isinstance(k, tuple) and k and k[0] == "mic"
+            ]:
+                self._destroy_loopback(key)
+        if hp != old_hp:
+            self._destroy_loopback(HP_LOOPBACK_KEY)
+        return True
+
+    def _reap_dead_loopbacks(self):
+        """Drop entries whose child has exited. True if any had."""
+        dead = [k for k, proc in list(self._procs.items()) if proc.poll() is not None]
+        for key in dead:
+            self._procs.pop(key, None)
+            _log.info("loopback %s exited; rebuilding", key)
+        return bool(dead)
+
+    def _ensure_hp_loopback(self):
+        """Personal Mix → headphones, whenever the Wave has a playback node.
+
+        Reconciled rather than spawned once at start, so it also appears if the
+        Wave arrives late and goes away when it leaves.
+        """
+        if self.hp:
+            self._spawn_loopback(
+                HP_LOOPBACK_KEY, PERSONAL_MIX_SINK, self.hp, HP_LOOPBACK_NODE,
+            )
+        else:
+            self._destroy_loopback(HP_LOOPBACK_KEY)
 
     # ----- persistence -----
     def _load_state(self):
@@ -255,8 +337,13 @@ class Mixer:
         the case for null-sink monitors. The link is set up after a brief
         wait so the node has time to register.
         """
-        if key in self._procs:
-            return
+        proc = self._procs.get(key)
+        if proc is not None:
+            if proc.poll() is None:
+                return
+            # Child is gone but its entry outlived it, which is what stops this
+            # from ever rebuilding.
+            self._procs.pop(key, None)
         capture_node_name = f"{node_name}_cap"
         try:
             proc = subprocess.Popen(
@@ -397,10 +484,6 @@ class Mixer:
     # ----- worker-side implementations -----
     def _do_start(self):
         self._sweep_stale_loopbacks()
-        if self.hp:
-            self._spawn_loopback(
-                HP_LOOPBACK_KEY, PERSONAL_MIX_SINK, self.hp, HP_LOOPBACK_NODE,
-            )
         with self._lock:
             self._streams = {s["id"]: s for s in list_audio_streams()}
         self._reconcile_all()
@@ -427,6 +510,7 @@ class Mixer:
 
     # ----- internal -----
     def _reconcile_all(self):
+        self._ensure_hp_loopback()
         for source_id in (["mic"] + list(self._sources.keys())):
             for mix_id in MIX_SINKS:
                 self._reconcile_cell(source_id, mix_id)
