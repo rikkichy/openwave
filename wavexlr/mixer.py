@@ -255,8 +255,13 @@ class Mixer:
         the case for null-sink monitors. The link is set up after a brief
         wait so the node has time to register.
         """
-        if key in self._procs:
-            return
+        proc = self._procs.get(key)
+        if proc is not None:
+            if proc.poll() is None:
+                return
+            # Child is gone but its entry outlived it, which is what stops this
+            # from ever rebuilding.
+            self._procs.pop(key, None)
         capture_node_name = f"{node_name}_cap"
         try:
             proc = subprocess.Popen(
