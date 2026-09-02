@@ -262,11 +262,16 @@ class Mixer:
             proc = subprocess.Popen(
                 [
                     "pw-loopback",
+                    # media.name is set explicitly because pw-loopback
+                    # otherwise derives it from its own PID, and WirePlumber
+                    # keys restore-stream on it.
                     "--capture-props="
                     f"node.autoconnect=false node.name={capture_node_name} "
+                    f"media.name={capture_node_name} "
                     "audio.channels=2 audio.position=[FL,FR]",
                     "--playback-props="
                     f"target.object={playback_target} node.name={node_name} "
+                    f"media.name={node_name} "
                     "audio.channels=2 audio.position=[FL,FR]",
                 ],
                 stdout=subprocess.DEVNULL,
