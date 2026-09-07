@@ -19,7 +19,6 @@ for diagnostics.
 
 import getpass
 import os
-import re
 import shlex
 import shutil
 import subprocess
@@ -147,7 +146,6 @@ class _Stub:
 class _Systemd:
     name = "systemd"
 
-    _EXEC_RE = re.compile(r"^ExecStart=(.*)$", re.M)
 
     def _user(self, *args, check=False):
         return subprocess.run(
@@ -178,11 +176,11 @@ class _Systemd:
         )
 
     def needs_refresh(self):
-        """Whether the installed unit still starts what this install ships.
+        """Whether the installed unit differs from this install's contract.
 
         `is_installed()` answers a narrower question -- systemd is willing to
-        report a unit enabled whatever its ExecStart names -- so on its own it
-        reads a unit that can never start as a feature in working order.
+        report a unit enabled even when its command vanished or its ordering is
+        stale, either of which leaves the capture fix unavailable when needed.
         """
         try:
             with open(self.unit_path()) as f:
@@ -190,17 +188,21 @@ class _Systemd:
         except OSError:
             return False  # nothing to refresh; install() is the path for that
 
-        m = self._EXEC_RE.search(installed)
-        if m is None:
-            return True
-        recorded = m.group(1).strip()
-        return recorded != _daemon_command() or not _program_exists(recorded)
+        expected = self._unit_text()
+        return (
+            installed != expected
+            or not _program_exists(_daemon_command())
+        )
 
     def _unit_text(self):
         lines = [
             "[Unit]",
             "Description=OpenWave Audio Manager",
-            "After=pipewire.service wireplumber.service",
+            # Start before the audio graph and stop after it. The capture pin
+            # must survive playback teardown or Wave firmware can remain wedged
+            # across a warm reboot, whose USB bus reset does not remove power.
+            "Wants=pipewire.service wireplumber.service",
+            "Before=pipewire.service wireplumber.service",
             # A unit that cannot start retries on the RestartSec= timer with
             # no limit of its own, which is a loop rather than a failure: it
             # never reaches `failed`, where both systemctl and the GUI would

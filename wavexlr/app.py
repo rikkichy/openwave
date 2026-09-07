@@ -55,11 +55,11 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         self._update_service_status()
         self.mixer = Mixer()
         self.mixer.set_sources(self._sources)
-        self.mixer.start()
         self.meter = MeterMonitor()
         self._meter_targets = {}
         self._wire_matrix_cells()
         self._start_meters()
+        self.mixer.start()
         self._start_stream_poll()
         self._try_connect()
 
@@ -766,6 +766,16 @@ class WaveXLRApp(Adw.Application):
     def do_activate(self):
         if not self._window:
             self._load_css()
+            # The user unit is OpenWave-owned state, so keep it aligned with
+            # the installed app without hiding a routine upgrade behind the
+            # first-run dialog. Failures still fall through to that repair UI.
+            if service.is_installed() and service.needs_refresh():
+                try:
+                    service.install()
+                except Exception as e:
+                    logging.getLogger("openwave.app").warning(
+                        "Failed to refresh audio service: %s", e
+                    )
             if setup.needs_setup():
                 self._show_setup_dialog()
                 return
@@ -802,10 +812,10 @@ class WaveXLRApp(Adw.Application):
         """Tear down device and audio subprocesses before exit."""
         if self._window is not None:
             self._window.shutdown()
-            if hasattr(self._window, "meter"):
-                self._window.meter.stop_all()
             if hasattr(self._window, "mixer"):
                 self._window.mixer.stop()
+            if hasattr(self._window, "meter"):
+                self._window.meter.stop_all()
         Adw.Application.do_shutdown(self)
 
     def _on_close_request(self, window):
@@ -817,7 +827,7 @@ class WaveXLRApp(Adw.Application):
     def _setup_tray(self):
         from .tray import TrayIcon
         self._tray = TrayIcon(
-            on_activate=self._toggle_window,
+            on_activate=self._show_window,
             on_mute=self._toggle_mute,
             on_quit=self._quit_app,
         )
@@ -837,12 +847,9 @@ class WaveXLRApp(Adw.Application):
         self.release()
         self.quit()
 
-    def _toggle_window(self):
+    def _show_window(self):
         if self._window:
-            if self._window.get_visible():
-                self._window.set_visible(False)
-            else:
-                self._window.present()
+            self._window.present()
 
     def _show_setup_dialog(self):
         dialog = Adw.AlertDialog(

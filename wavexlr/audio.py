@@ -81,6 +81,12 @@ MAX_SILENCE_RECYCLES = 1
 # to attach, negotiate, and start emitting samples.
 STARTUP_GRACE = 1.0
 
+# Retry quickly while PipeWire is publishing the device, then back off when a
+# Wave device is genuinely absent. This keeps capture ahead of playback during
+# login without polling an unplugged setup several times per second forever.
+ABSENT_RETRY_INITIAL = 0.1
+ABSENT_RETRY_MAX = 5.0
+
 # How long to wait for SIGTERM before escalating to SIGKILL when killing
 # a wedged keepalive. A wedged pw-cat may not respond to SIGTERM at all
 # (its main thread is blocked on a stalled stream read), so we don't
@@ -166,6 +172,7 @@ class AudioManager:
         self._silence_recycles = 0
         self._muted = False
         self._mute_checked_at = 0.0
+        self._absent_retry = ABSENT_RETRY_INITIAL
         self._healthy = False
         self._state = "absent"
         self._device_present = False
@@ -369,9 +376,13 @@ class AudioManager:
                 source_name = _get_source_node_name()
                 if not source_name:
                     self._update_status(False, False, "absent")
-                    time.sleep(5)
+                    time.sleep(self._absent_retry)
+                    self._absent_retry = min(
+                        ABSENT_RETRY_MAX, self._absent_retry * 2
+                    )
                     continue
 
+                self._absent_retry = ABSENT_RETRY_INITIAL
                 self._start_cat(source_name)
                 time.sleep(STARTUP_GRACE)
                 started = self._cat_alive() and self._data_flowing()

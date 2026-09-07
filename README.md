@@ -15,7 +15,7 @@ Linux control application for **Elgato Wave** audio devices — the **Wave XLR**
 - **Headphone controls** — Volume (syncs with hardware knob), low impedance mode
 - **Hardware sync** — 10 Hz polling keeps the app in sync with physical controls
 - **System integration** — Mute and HP volume sync bidirectionally with PipeWire/ALSA
-- **Audio capture fix** — Background daemon (systemd or runit) prevents the firmware race condition where mic goes silent
+- **Audio capture fix** — Starts capture before playback, keeps it pinned while running, and tears it down after the audio graph so Wave firmware survives warm reboots
 - **System tray** — Runs in background with tray icon, mute from tray menu
 - **First-run setup** — Configures udev permissions and audio service automatically
 
