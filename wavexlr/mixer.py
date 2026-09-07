@@ -63,16 +63,24 @@ def _pactl_short(kind):
     return [line.split("\t") for line in r.stdout.splitlines() if line.strip()]
 
 
+CARD_NAME_TOKENS = ("Elgato_Wave_", "Elgato_XLR_Dock")
+
+
+def _is_wave_card(node_name):
+    """Whether a PipeWire ALSA node belongs to a supported Wave family."""
+    return any(token in node_name for token in CARD_NAME_TOKENS)
+
+
 def find_wave_xlr_alsa():
     """Return (mic_node_name, hp_node_name); either may be None if unplugged."""
     mic = next(
         (p[1] for p in _pactl_short("sources")
-         if len(p) > 1 and p[1].startswith("alsa_input") and "Elgato_Wave_" in p[1]),
+         if len(p) > 1 and p[1].startswith("alsa_input") and _is_wave_card(p[1])),
         None,
     )
     hp = next(
         (p[1] for p in _pactl_short("sinks")
-         if len(p) > 1 and p[1].startswith("alsa_output") and "Elgato_Wave_" in p[1]),
+         if len(p) > 1 and p[1].startswith("alsa_output") and _is_wave_card(p[1])),
         None,
     )
     return mic, hp
