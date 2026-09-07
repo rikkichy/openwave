@@ -11,6 +11,9 @@ profiles.py; connect() picks the first supported device found.
 
 import ctypes
 import ctypes.util
+import glob
+import os
+import re
 import struct
 import subprocess
 import threading
@@ -55,16 +58,45 @@ _ctx = ctypes.c_void_p()
 _lib.libusb_init(ctypes.byref(_ctx))
 
 
-def _find_card(matches):
-    """Find the ALSA card number for the device."""
+def _find_card(matches, *, vid=None, pid=None, usbbus=None):
+    """Find the ALSA card for one USB device without guessing its identity."""
+    paths = sorted(glob.glob("/proc/asound/card*/usbid"))
+    if vid is not None and pid is not None and paths:
+        wanted_id = f"{vid:04x}:{pid:04x}"
+        readable = False
+        for path in paths:
+            try:
+                with open(path) as f:
+                    actual_id = f.read().strip().lower()
+            except OSError:
+                continue
+            readable = True
+            if actual_id != wanted_id:
+                continue
+            if usbbus is not None:
+                try:
+                    with open(os.path.join(os.path.dirname(path), "usbbus")) as f:
+                        actual_bus = f.read().strip()
+                except OSError:
+                    continue
+                if actual_bus != usbbus:
+                    continue
+            card_dir = os.path.basename(os.path.dirname(path))
+            if card_dir.startswith("card") and card_dir[4:].isdigit():
+                return card_dir[4:]
+        if readable:
+            return None
+
+    # Older kernels may not expose /proc/asound/card*/usbid. Only that case
+    # falls back to product-name matching, which cannot distinguish duplicates.
     try:
-        r = subprocess.run(
+        result = subprocess.run(
             ["aplay", "-l"], capture_output=True, text=True, timeout=3
         )
-        if r.returncode != 0:
+        if result.returncode != 0:
             return None
-        for line in r.stdout.splitlines():
-            if any(m in line for m in matches):
+        for line in result.stdout.splitlines():
+            if any(match in line for match in matches):
                 return line.split(":")[0].split()[-1]
     except Exception:
         pass
@@ -74,52 +106,124 @@ def _find_card(matches):
 def _amixer(card, *args):
     """Run amixer, returning None when the control interface did not answer."""
     try:
-        r = subprocess.run(
+        result = subprocess.run(
             ["amixer", "-c", card, *args],
             capture_output=True, text=True, timeout=3,
         )
-        return r.stdout if r.returncode == 0 else None
+        return result.stdout if result.returncode == 0 else None
     except Exception:
         return None
 
 
+_ALSA_ROLE_SUFFIX = {
+    "Capture Switch": "mute",
+    "Capture Volume": "gain",
+    "Playback Volume": "hp_vol",
+}
+_ALSA_ROLE_FALLBACK = {"mute": 5, "gain": 6, "hp_vol": 4}
+_ALSA_NUMIDS = {}
+_ALSA_CTL_MAX = {}
+
+
+def _discover_numids(card):
+    """Discover control roles and ranges from one `amixer contents` pass."""
+    if card in _ALSA_NUMIDS:
+        return _ALSA_NUMIDS[card]
+    found = {}
+    current_id = None
+    current_name = None
+    for line in (_amixer(card, "contents") or "").splitlines():
+        stripped = line.strip()
+        match = re.match(r"numid=(\d+),iface=(\w+),name='(.*)'", stripped)
+        if match:
+            current_id = int(match.group(1))
+            current_name = match.group(3)
+            if match.group(2) != "MIXER":
+                current_id = current_name = None
+            continue
+        if current_id is None or not stripped.startswith("; type="):
+            continue
+        role = next(
+            (
+                role
+                for suffix, role in _ALSA_ROLE_SUFFIX.items()
+                if current_name.endswith(suffix)
+            ),
+            None,
+        )
+        if role and role not in found:
+            found[role] = current_id
+            maximum = re.search(r",max=(-?\d+)", stripped)
+            if maximum:
+                _ALSA_CTL_MAX[(card, current_id)] = int(maximum.group(1))
+    _ALSA_NUMIDS[card] = found
+    return found
+
+
+def _numid(card, role):
+    return _discover_numids(card).get(role, _ALSA_ROLE_FALLBACK[role])
+
+
+def _alsa_ctl_max(card, numid, fallback):
+    """Return the driver-reported maximum for one ALSA control."""
+    key = (card, numid)
+    if key not in _ALSA_CTL_MAX:
+        output = _amixer(card, "cget", f"numid={numid}") or ""
+        maximum = re.search(r",max=(-?\d+)", output)
+        _ALSA_CTL_MAX[key] = int(maximum.group(1)) if maximum else fallback
+    return _ALSA_CTL_MAX[key]
+
+
+def _forget_alsa_card(card):
+    if card is None:
+        return
+    _ALSA_NUMIDS.pop(card, None)
+    for key in [key for key in _ALSA_CTL_MAX if key[0] == card]:
+        del _ALSA_CTL_MAX[key]
+
+
 def _alsa_get(card):
-    """Read ALSA mute and HP volume."""
+    """Read ALSA mute and headphone volume without inventing failed values."""
     state = {}
-    # Mute (numid=5)
-    out = _amixer(card, "cget", "numid=5")
-    if out is not None and ": values=" in out:
-        state["mute"] = ": values=off" in out
-    # HP volume (numid=4) — raw ALSA value 0-120
-    out = _amixer(card, "cget", "numid=4")
-    if out is not None:
-        for line in out.splitlines():
-            if ": values=" in line:
-                try:
-                    state["hp_vol"] = int(line.split("=")[-1])
-                except ValueError:
-                    pass
+    output = _amixer(card, "cget", f"numid={_numid(card, 'mute')}")
+    if output is not None and ": values=" in output:
+        state["mute"] = ": values=off" in output
+    output = _amixer(card, "cget", f"numid={_numid(card, 'hp_vol')}")
+    if output is not None:
+        for line in output.splitlines():
+            if ": values=" not in line:
+                continue
+            try:
+                state["hp_vol"] = int(line.split("=")[-1])
+            except ValueError:
+                pass
     return state
 
 
 def _alsa_set_mute(card, muted):
-    _amixer(card, "cset", "numid=5", "off" if muted else "on")
+    _amixer(
+        card, "cset", f"numid={_numid(card, 'mute')}",
+        "off" if muted else "on",
+    )
 
 
 def _alsa_set_hp_vol(card, value):
-    """Set ALSA HP volume (numid=4, 0-120)."""
-    _amixer(card, "cset", "numid=4", str(max(0, min(120, value))))
+    """Set ALSA headphone volume within the control's reported range."""
+    numid = _numid(card, "hp_vol")
+    maximum = _alsa_ctl_max(card, numid, 120)
+    _amixer(card, "cset", f"numid={numid}", str(max(0, min(maximum, value))))
 
 
 def _alsa_set_gain(card, value):
-    """Set ALSA mic gain (numid=6, 0-80)."""
-    _amixer(card, "cset", "numid=6", str(max(0, min(80, value))))
+    """Set ALSA microphone gain within the control's reported range."""
+    numid = _numid(card, "gain")
+    maximum = _alsa_ctl_max(card, numid, 150)
+    _amixer(card, "cset", f"numid={numid}", str(max(0, min(maximum, value))))
 
 
 def _fw_gain_to_alsa(fw_gain_raw, scale):
-    """Map firmware gain (raw / scale dB) to ALSA (0-80, 0.5 dB steps)."""
-    db = fw_gain_raw / scale
-    return max(0, min(80, round(db / 0.5)))
+    """Map firmware dB to the ALSA control's half-dB steps."""
+    return max(0, round((fw_gain_raw / scale) / 0.5))
 
 
 def _fw_hp_to_alsa(fw_hp_raw, scale):
@@ -162,13 +266,18 @@ class WaveDevice:
 
             # snd-usb-audio and OpenWave share endpoint 0. Do not start vendor
             # transfers while ALSA is still probing the device at login.
-            card = _find_card(profile.card_match)
+            card = _find_card(
+                profile.card_match, vid=profile.vid, pid=profile.pid
+            )
             if card is None:
                 _lib.libusb_close(handle)
                 raise DeviceNotReadyError(
                     f"{profile.display_name} audio interface is not ready"
                 )
-            if _amixer(card, "cget", "numid=5") is None:
+            _forget_alsa_card(card)
+            mute_numid = _numid(card, "mute")
+            if _amixer(card, "cget", f"numid={mute_numid}") is None:
+                _forget_alsa_card(card)
                 _lib.libusb_close(handle)
                 raise DeviceUnresponsiveError(
                     f"{profile.display_name} control interface is not responding"
@@ -181,12 +290,14 @@ class WaveDevice:
         raise DeviceNotReadyError("No supported Elgato Wave device found")
 
     def disconnect(self):
+        card = self._card
         with self._lock:
             if self._handle:
                 _lib.libusb_close(self._handle)
                 self._handle = None
             self._card = None
             self._last_fw = None
+        _forget_alsa_card(card)
 
     def _ctrl_read(self, wValue, length):
         """USB control read — no detach needed."""
