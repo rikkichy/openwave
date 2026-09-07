@@ -6,13 +6,13 @@ Linux control application for **Elgato Wave** audio devices — the **Wave XLR**
 
 | Device | USB ID | Controls |
 |---|---|---|
-| Wave XLR | `0fd9:007d` | Gain, mute, headphone volume, low impedance mode |
-| XLR Dock (`00a6` variant) | `0fd9:00a6` | Gain, mute, headphone volume, low impedance mode |
+| Wave XLR | `0fd9:007d` | Gain, mute, 48 V phantom power, headphone volume, low impedance mode |
+| XLR Dock (`00a6` variant) | `0fd9:00a6` | Gain, mute, 48 V phantom power, headphone volume, low impedance mode |
 | Wave:3 | `0fd9:0070` | Gain, mute, headphone volume, monitor mix |
 
 ## Features
 
-- **Microphone controls** — Gain, mute (syncs with hardware button)
+- **Microphone controls** — Gain, mute (syncs with hardware button), and profile-gated 48 V phantom power
 - **Headphone controls** — Volume (syncs with hardware knob), low impedance mode
 - **Hardware sync** — 10 Hz polling keeps the app in sync with physical controls
 - **System integration** — Mute and HP volume sync bidirectionally with PipeWire/ALSA
@@ -24,7 +24,7 @@ Linux control application for **Elgato Wave** audio devices — the **Wave XLR**
 
 Wave devices use USB Class control transfers on endpoint 0 for device configuration. On Linux, `snd-usb-audio` normally blocks these transfers because `wIndex=0x3300` routes through interface 0 (owned by the audio driver). OpenWave uses `wIndex=0x3303` instead — the firmware only checks the `0x33` prefix, while the kernel sees interface 3 (unclaimed) and lets the transfer through. No driver detach needed, audio is never interrupted.
 
-The Wave XLR and `0fd9:00a6` XLR Dock share a 34-byte config block (gain uint16 Q8.8 dB @0, mute @4, HP volume int16 Q8.8 @9, knob mode @14, low-Z @33). The Wave:3 uses a 16-byte block (gain uint16 Q8.8 dB @0, mute @4, HP volume int16 Q8.8 @7, monitor mix uint16 Q8.8 percent @10, dial mode @12 — 1=gain, 2=headphones, 3=mix). All use USB Class control transfers (`bRequest` 0x85 read / 0x05 write). Per-model constants live in `wavexlr/profiles.py`; `python3 -m wavexlr.probe` (`dump` / `watch` / `poke`) verifies a device against its profile and helps map new fields. The device services vendor transfers from only one process at a time, so quit OpenWave before probing.
+The Wave XLR and `0fd9:00a6` XLR Dock share a 34-byte config block (gain uint16 Q8.8 dB @0, mute @4, 48 V phantom power @6, HP volume int16 Q8.8 @9, knob mode @14, low-Z @33). The Wave:3 uses a 16-byte block (gain uint16 Q8.8 dB @0, mute @4, HP volume int16 Q8.8 @7, monitor mix uint16 Q8.8 percent @10, dial mode @12 — 1=gain, 2=headphones, 3=mix). All use USB Class control transfers (`bRequest` 0x85 read / 0x05 write). Per-model constants live in `wavexlr/profiles.py`; `python3 -m wavexlr.probe` (`dump` / `watch` / `poke`) verifies a device against its profile and helps map new fields. The device services vendor transfers from only one process at a time, so quit OpenWave before probing.
 
 ## Install
 

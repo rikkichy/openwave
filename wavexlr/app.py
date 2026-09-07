@@ -212,6 +212,15 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         self.gain_scale.connect("value-changed", self._on_gain_changed)
         parent.append(self.gain_scale)
 
+        phantom_row = Adw.SwitchRow(
+            title="48V Phantom Power",
+            subtitle="For condenser microphones; turn off before unplugging",
+        )
+        phantom_row.connect("notify::active", self._on_phantom_changed)
+        self.phantom_row = phantom_row
+        mic_group.add(phantom_row)
+
+
         knob_row = Adw.ActionRow(title="Knob Controls", subtitle="What the physical knob adjusts")
         self.knob_label = Gtk.Label(label="Gain")
         self.knob_label.add_css_class("dim-label")
@@ -488,6 +497,7 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         self.gain_scale.get_adjustment().set_upper(profile.gain_max)
         self.knob_row.set_visible(profile.has_vol_select)
         self.lowz_row.set_visible(profile.has_low_z)
+        self.phantom_row.set_visible(profile.has_phantom)
         self.mix_row.set_visible(profile.has_monitor_mix)
         self.mix_scale.set_visible(profile.has_monitor_mix)
         if profile.has_monitor_mix:
@@ -512,6 +522,8 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         self.hp_label.set_label(f"{state['hp_volume_db']:.1f} dB")
         if "low_impedance" in state:
             self.lowz_row.set_active(state["low_impedance"])
+        if "phantom" in state:
+            self.phantom_row.set_active(state["phantom"])
         if "volume_select" in state:
             self.knob_label.set_label(KNOB_LABELS.get(state["volume_select"], "Gain"))
         if "monitor_mix" in state:
@@ -571,6 +583,15 @@ class WaveXLRWindow(Adw.ApplicationWindow):
             return
         enabled = row.get_active()
         self._usb_async(lambda: self.dev.set_low_impedance(enabled), on_error=self._on_usb_error)
+
+    def _on_phantom_changed(self, row, _pspec):
+        if self._updating_ui or not self.dev.connected:
+            return
+        enabled = row.get_active()
+        self._usb_async(
+            lambda: self.dev.set_phantom(enabled), on_error=self._on_usb_error
+        )
+
 
     def _on_mix_changed(self, scale):
         if self._updating_ui or not self.dev.connected:
