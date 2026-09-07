@@ -3,7 +3,7 @@
 Config offsets set to None mean the device lacks that feature.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 
 @dataclass(frozen=True)
@@ -118,4 +118,15 @@ WAVE3 = DeviceProfile(
     sync_alsa_gain=True,
 )
 
-PROFILES = (WAVE_XLR, WAVE3)
+# The 0fd9:00a6 XLR Dock speaks the original Wave XLR vendor protocol.
+# Hardware captures decode the same config and device-info offsets, including
+# a serial at bytes 27..46 that matches the ALSA card identity.
+WAVE_XLR_MK2 = replace(
+    WAVE_XLR,
+    key="wave_xlr_mk2",
+    display_name="Wave XLR MK.2 (0fd9:00a6)",
+    pid=0x00A6,
+    card_match=("XLR Dock", "Wave XLR", "Elgato"),
+)
+
+PROFILES = (WAVE_XLR, WAVE_XLR_MK2, WAVE3)

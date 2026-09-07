@@ -4,11 +4,15 @@ import os
 import subprocess
 
 from . import paths, service
+from .profiles import PROFILES
 
-UDEV_RULES = (
-    'SUBSYSTEM=="usb", ATTR{idVendor}=="0fd9", ATTR{idProduct}=="007d", MODE="0666"',  # Wave XLR
-    'SUBSYSTEM=="usb", ATTR{idVendor}=="0fd9", ATTR{idProduct}=="0070", MODE="0666"',  # Wave:3
+UDEV_RULES = tuple(
+    'SUBSYSTEM=="usb", '
+    f'ATTR{{idVendor}}=="{profile.vid:04x}", '
+    f'ATTR{{idProduct}}=="{profile.pid:04x}", MODE="0666"'
+    for profile in PROFILES
 )
+UDEV_PRODUCT_IDS = tuple(f"{profile.pid:04x}" for profile in PROFILES)
 UDEV_PATH = "/etc/udev/rules.d/99-openwave.rules"
 UDEV_PATH_OLD = "/etc/udev/rules.d/99-wavexlr.rules"
 
@@ -36,7 +40,7 @@ def udev_installed():
         try:
             with open(path) as f:
                 content = f.read()
-            if all(pid in content for pid in ("007d", "0070")):
+            if all(product_id in content for product_id in UDEV_PRODUCT_IDS):
                 return True
         except (FileNotFoundError, PermissionError):
             continue
@@ -104,13 +108,18 @@ def anything_installed():
 def install_udev():
     """Install udev rules via pkexec."""
     rules = "\n".join(UDEV_RULES)
+    trigger_lines = "\n".join(
+        "udevadm trigger --subsystem-match=usb "
+        f"--attr-match=idVendor={profile.vid:04x} "
+        f"--attr-match=idProduct={profile.pid:04x}"
+        for profile in PROFILES
+    )
     script = f"""#!/bin/sh
 cat > {UDEV_PATH} <<'EOF'
 {rules}
 EOF
 udevadm control --reload-rules
-udevadm trigger --subsystem-match=usb --attr-match=idVendor=0fd9 --attr-match=idProduct=007d
-udevadm trigger --subsystem-match=usb --attr-match=idVendor=0fd9 --attr-match=idProduct=0070
+{trigger_lines}
 # Also chmod the device node directly so no replug is needed
 for dev in /dev/bus/usb/*/; do
     for f in "$dev"*; do
