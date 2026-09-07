@@ -143,7 +143,7 @@ def _alsa_hp_to_fw(alsa_hp, scale):
 class WaveDevice:
     def __init__(self):
         self._handle = None
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._card = None
         self._last_fw = None  # last known firmware state for change detection
         self.profile = None
@@ -181,11 +181,12 @@ class WaveDevice:
         raise DeviceNotReadyError("No supported Elgato Wave device found")
 
     def disconnect(self):
-        if self._handle:
-            _lib.libusb_close(self._handle)
-            self._handle = None
-        self._card = None
-        self._last_fw = None
+        with self._lock:
+            if self._handle:
+                _lib.libusb_close(self._handle)
+                self._handle = None
+            self._card = None
+            self._last_fw = None
 
     def _ctrl_read(self, wValue, length):
         """USB control read — no detach needed."""
@@ -253,6 +254,13 @@ class WaveDevice:
         p = self.profile
         raw = struct.unpack_from(p.hp_fmt, self.read_config(), p.off_hp_vol)[0]
         return raw / p.hp_scale
+
+    def get_phantom(self):
+        """Return phantom-power state, or None without a powered XLR input."""
+        if self.profile.off_phantom is None:
+            return None
+        return bool(self.read_config()[self.profile.off_phantom])
+
 
     def get_low_impedance(self):
         if self.profile.off_low_z is None:
@@ -333,26 +341,38 @@ class WaveDevice:
             state["volume_select"] = p.vol_select_map.get(config[p.off_vol_select], "gain")
         if p.off_low_z is not None:
             state["low_impedance"] = bool(config[p.off_low_z])
+        if p.off_phantom is not None:
+            state["phantom"] = bool(config[p.off_phantom])
         if p.off_monitor_mix is not None:
             state["monitor_mix"] = struct.unpack_from('<H', config, p.off_monitor_mix)[0]
         return state
 
     # --- High-level setters (read-modify-write) ---
+    def _write_config_byte(self, offset, value):
+        """Atomically update one byte in the shared firmware config block."""
+        with self._lock:
+            config = self.read_config()
+            config[offset] = value
+            self.write_config(config)
+
+    def _write_config_value(self, fmt, offset, value):
+        """Atomically update one packed value in the firmware config block."""
+        with self._lock:
+            config = self.read_config()
+            struct.pack_into(fmt, config, offset, value)
+            self.write_config(config)
+
 
     def set_gain_raw(self, value):
         value = max(0, min(0xFFFF, value))
-        config = self.read_config()
-        struct.pack_into('<H', config, self.profile.off_gain, value)
-        self.write_config(config)
+        self._write_config_value('<H', self.profile.off_gain, value)
         if self._last_fw:
             self._last_fw["gain"] = value
         if self._card and self.profile.sync_alsa_gain:
             _alsa_set_gain(self._card, _fw_gain_to_alsa(value, self.profile.gain_scale))
 
     def set_mute(self, muted):
-        config = self.read_config()
-        config[self.profile.off_mute] = 0x01 if muted else 0x00
-        self.write_config(config)
+        self._write_config_byte(self.profile.off_mute, 0x01 if muted else 0x00)
         if self._last_fw:
             self._last_fw["mute"] = muted
         if self._card and self.profile.sync_alsa_mute:
@@ -362,29 +382,34 @@ class WaveDevice:
         p = self.profile
         db = max(-128.0, min(0.0, db))
         raw = int(db * p.hp_scale)
-        config = self.read_config()
-        struct.pack_into(p.hp_fmt, config, p.off_hp_vol, raw)
-        self.write_config(config)
+        self._write_config_value(p.hp_fmt, p.off_hp_vol, raw)
         if self._last_fw:
             self._last_fw["hp"] = raw
         if self._card and p.sync_alsa_hp:
             _alsa_set_hp_vol(self._card, _fw_hp_to_alsa(raw, p.hp_scale))
 
+    def set_phantom(self, enabled):
+        """Switch 48 V phantom power on profiles that expose the control."""
+        if self.profile.off_phantom is None:
+            return
+        self._write_config_byte(
+            self.profile.off_phantom, 0x01 if enabled else 0x00
+        )
+
+
     def set_low_impedance(self, enabled):
         if self.profile.off_low_z is None:
             return
-        config = self.read_config()
-        config[self.profile.off_low_z] = 0x01 if enabled else 0x00
-        self.write_config(config)
+        self._write_config_byte(
+            self.profile.off_low_z, 0x01 if enabled else 0x00
+        )
 
     def set_monitor_mix(self, value):
         p = self.profile
         if p.off_monitor_mix is None:
             return
         value = max(0, min(p.mix_max, int(value)))
-        config = self.read_config()
-        struct.pack_into('<H', config, p.off_monitor_mix, value)
-        self.write_config(config)
+        self._write_config_value('<H', p.off_monitor_mix, value)
 
 
 WaveXLR = WaveDevice
