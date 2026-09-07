@@ -196,7 +196,7 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         mic_group.add(mute_row)
 
         gain_row = Adw.ActionRow(title="Gain")
-        self.gain_label = Gtk.Label(label="0x0000", width_chars=8, xalign=1)
+        self.gain_label = Gtk.Label(label="0 dB", width_chars=8, xalign=1)
         self.gain_label.add_css_class("monospace")
         gain_row.add_suffix(self.gain_label)
         mic_group.add(gain_row)
@@ -492,7 +492,7 @@ class WaveXLRWindow(Adw.ApplicationWindow):
     def _format_gain(self, raw):
         scale = self.dev.profile.gain_scale if self.dev.profile else None
         if scale:
-            return f"{raw / scale:.1f} dB"
+            return f"{raw / scale:.2f}".rstrip("0").rstrip(".") + " dB"
         return f"0x{raw:04X}"
 
     def _apply_state(self, state):
