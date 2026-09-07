@@ -6,7 +6,7 @@ pkgdesc="Linux control application for the Elgato Wave XLR and Wave:3"
 arch=('any')
 url="https://github.com/rikkichy/openwave"
 license=('MIT')
-depends=('python' 'python-gobject' 'gtk4' 'libadwaita' 'libusb' 'pipewire')
+depends=('python' 'python-gobject' 'gtk4' 'libadwaita' 'libusb' 'pipewire' 'alsa-utils' 'libpulse')
 source=("$pkgname-$pkgver.tar.gz::https://github.com/rikkichy/openwave/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('SKIP')
 

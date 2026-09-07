@@ -16,6 +16,12 @@
           pythonEnv = pkgs.python3.withPackages (ps: [ ps.pygobject3 ]);
           sitePkgs = pkgs.python3.sitePackages; # "lib/python3.X/site-packages"
           usbLibs = pkgs.lib.makeLibraryPath [ pkgs.libusb1 ];
+          runtimeBins = pkgs.lib.makeBinPath [
+            pkgs.alsa-utils
+            pkgs.pipewire
+            pkgs.procps
+            pkgs.pulseaudio
+          ];
         in
         rec {
           openwave = pkgs.stdenv.mkDerivation {
@@ -77,13 +83,15 @@
               wrapProgram $out/bin/openwave \
                 --prefix PYTHONPATH : $out/${sitePkgs} \
                 --prefix LD_LIBRARY_PATH : ${usbLibs} \
+                --prefix PATH : ${runtimeBins} \
                 "''${gappsWrapperArgs[@]}"
 
               # The Makefile installs this launcher too; it just needs the same
               # import path as the GUI one. service.py points ExecStart at it.
               wrapProgram $out/bin/openwave-daemon \
                 --prefix PYTHONPATH : $out/${sitePkgs} \
-                --prefix LD_LIBRARY_PATH : ${usbLibs}
+                --prefix LD_LIBRARY_PATH : ${usbLibs} \
+                --prefix PATH : ${runtimeBins}
             '';
 
             meta = {

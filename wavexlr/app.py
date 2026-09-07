@@ -8,9 +8,9 @@ from gi.repository import Gtk, Adw, GLib, GObject, Gio, Gdk
 import logging
 import os
 import sys
-import threading
+from concurrent.futures import ThreadPoolExecutor
 
-from .device import WaveDevice
+from .device import DeviceNotReadyError, DeviceUnresponsiveError, WaveDevice
 from .meter import MeterMonitor
 from .mixer import Mixer
 from .mixmatrix import MixMatrix
@@ -27,6 +27,17 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         super().__init__(**kwargs, title="OpenWave", default_width=1100, default_height=620)
         self.set_size_request(900, 520)
         self.dev = WaveDevice()
+        # All control transfers share endpoint 0. Keep them on one worker:
+        # overlapping polls can queue behind a one-second USB timeout and keep
+        # hammering a device that is already failing.
+        self._usb_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="openwave-usb"
+        )
+        self._shutting_down = False
+        self._connect_pending = False
+        self._reconnect_id = None
+        self._poll_pending = False
+        self._poll_failures = 0
         self._gain_max = 0x5000
         self._updating_ui = False
         self._last_state = None
@@ -322,30 +333,59 @@ class WaveXLRWindow(Adw.ApplicationWindow):
             err.choose(self, None, lambda d, r: d.choose_finish(r))
 
     def _usb_async(self, fn, on_done=None, on_error=None):
-        """Run fn in a background thread; call on_done/on_error on GTK thread."""
-        def _worker():
+        """Run a USB operation on the single device worker."""
+        if self._shutting_down:
+            return None
+
+        future = self._usb_executor.submit(fn)
+
+        def _finished(done):
+            if self._shutting_down:
+                return
             try:
-                result = fn()
-                if on_done:
-                    GLib.idle_add(on_done, result)
+                result = done.result()
             except Exception as e:
                 if on_error:
                     GLib.idle_add(on_error, e)
-        threading.Thread(target=_worker, daemon=True).start()
+            else:
+                if on_done:
+                    GLib.idle_add(on_done, result)
+
+        future.add_done_callback(_finished)
+        return future
 
     def _try_connect(self):
+        if self._connect_pending or self._shutting_down:
+            return
+        if self._reconnect_id:
+            GLib.source_remove(self._reconnect_id)
+            self._reconnect_id = None
+        self._stop_polling()
+        self._connect_pending = True
         self.status_label.set_label("Connecting...")
+
         def _connect():
             self.dev.disconnect()
-            self.dev.connect()
-            info = {}
             try:
-                info = self.dev.read_device_info()
+                self.dev.connect()
+                info = {}
+                try:
+                    info = self.dev.read_device_info()
+                except Exception:
+                    pass
+                return {"state": self.dev.get_all(), "info": info}
             except Exception:
-                pass
-            return {"state": self.dev.get_all(), "info": info}
+                self.dev.disconnect()
+                raise
+
         def _done(result):
+            self._connect_pending = False
+            self._poll_pending = False
+            self._poll_failures = 0
             self._apply_profile(self.dev.profile)
+            logging.getLogger("openwave.app").info(
+                "Connected to %s", self.dev.profile.display_name
+            )
             self.status_label.remove_css_class("dim-label")
             self._apply_state(result["state"])
             info = result["info"]
@@ -353,10 +393,32 @@ class WaveXLRWindow(Adw.ApplicationWindow):
             self.api_label.set_label(info.get("api_version", "—"))
             self.serial_label.set_label(info.get("serial", "—"))
             self._start_polling()
+
         def _fail(e):
-            self.status_label.set_label("Disconnected")
+            self._connect_pending = False
+            logging.getLogger("openwave.app").warning(
+                "Device connection failed: %s", e
+            )
+            if isinstance(e, DeviceUnresponsiveError):
+                self.status_label.set_label("Power-cycle Wave device")
+            else:
+                self.status_label.set_label("Disconnected")
             self.status_label.add_css_class("dim-label")
+            if isinstance(e, DeviceNotReadyError):
+                self._schedule_reconnect()
+
         self._usb_async(_connect, _done, _fail)
+
+    def _schedule_reconnect(self):
+        if self._reconnect_id or self._shutting_down:
+            return
+
+        def _retry():
+            self._reconnect_id = None
+            self._try_connect()
+            return False
+
+        self._reconnect_id = GLib.timeout_add_seconds(2, _retry)
 
     def _start_polling(self):
         """Start 10 Hz polling to sync hardware state."""
@@ -370,23 +432,49 @@ class WaveXLRWindow(Adw.ApplicationWindow):
             self._poll_id = None
 
     def _poll_tick(self):
-        """Called every 100ms — read device state in background."""
+        """Queue one poll when the previous poll has completed."""
         if not self.dev.connected:
             self._poll_id = None
-            return False  # stop polling
-        # Only poll if not already busy with a user-initiated write
-        self._usb_async(self.dev.get_all, self._on_poll_result, self._on_poll_error)
-        return True  # keep polling
+            return False
+        if self._poll_pending:
+            return True
+        self._poll_pending = True
+        self._usb_async(
+            self.dev.get_all, self._on_poll_result, self._on_poll_error
+        )
+        return True
 
     def _on_poll_result(self, state):
+        self._poll_pending = False
+        self._poll_failures = 0
         if state != self._last_state:
             self._apply_state(state)
 
     def _on_poll_error(self, e):
-        self.status_label.set_label("Disconnected")
+        self._poll_pending = False
+        self._poll_failures += 1
+        logging.getLogger("openwave.app").warning(
+            "Device poll failed (%d/3): %s", self._poll_failures, e
+        )
+        if self._poll_failures < 3:
+            return
+        if isinstance(e, DeviceUnresponsiveError):
+            self.status_label.set_label("Power-cycle Wave device")
+        else:
+            self.status_label.set_label("Disconnected")
         self.status_label.add_css_class("dim-label")
-        self.dev.disconnect()
         self._stop_polling()
+        self._usb_async(self.dev.disconnect)
+
+    def shutdown(self):
+        """Stop queued USB work before closing the shared libusb handle."""
+        self._shutting_down = True
+        if self._reconnect_id:
+            GLib.source_remove(self._reconnect_id)
+            self._reconnect_id = None
+        self._stop_polling()
+        self._usb_executor.shutdown(wait=True, cancel_futures=True)
+        self.dev.disconnect()
 
     def _apply_profile(self, profile):
         """Adapt the UI to the connected device model."""
@@ -428,10 +516,14 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         self._updating_ui = False
 
     def _on_usb_error(self, e):
-        self.status_label.set_label("Disconnected")
+        logging.getLogger("openwave.app").warning("Device write failed: %s", e)
+        if isinstance(e, DeviceUnresponsiveError):
+            self.status_label.set_label("Power-cycle Wave device")
+        else:
+            self.status_label.set_label("Disconnected")
         self.status_label.add_css_class("dim-label")
-        self.dev.disconnect()
         self._stop_polling()
+        self._usb_async(self.dev.disconnect)
 
     def _on_mute_changed(self, row, _pspec):
         if self._updating_ui or not self.dev.connected:
@@ -707,8 +799,9 @@ class WaveXLRApp(Adw.Application):
             )
 
     def do_shutdown(self):
-        """Tear down loopback + meter subprocesses before the process exits."""
+        """Tear down device and audio subprocesses before exit."""
         if self._window is not None:
+            self._window.shutdown()
             if hasattr(self._window, "meter"):
                 self._window.meter.stop_all()
             if hasattr(self._window, "mixer"):
@@ -803,11 +896,6 @@ class WaveXLRApp(Adw.Application):
         self._window = win
         win.present()
 
-    def do_shutdown(self):
-        if self._window:
-            self._window._stop_polling()
-            self._window.dev.disconnect()
-        Adw.Application.do_shutdown(self)
 
 
 def main():

@@ -52,7 +52,8 @@ sudo make -C /path/to/openwave uninstall PREFIX=/usr/local
 
 - Python 3.10+
 - GTK4, libadwaita
-- PipeWire (for audio capture fix)
+- PipeWire and PulseAudio client tools (`pw-*`, `pactl`)
+- ALSA utilities (`aplay`, `amixer`)
 - libusb 1.0
 
 ## Usage

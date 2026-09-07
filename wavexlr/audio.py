@@ -169,6 +169,7 @@ class AudioManager:
         self._healthy = False
         self._state = "absent"
         self._device_present = False
+        self._status_reported = False
         self.on_status_change = on_status_change
 
     @property
@@ -297,13 +298,15 @@ class AudioManager:
 
     def _update_status(self, present, healthy, state):
         changed = (
-            present != self._device_present
+            not self._status_reported
+            or present != self._device_present
             or healthy != self._healthy
             or state != self._state
         )
         self._device_present = present
         self._healthy = healthy
         self._state = state
+        self._status_reported = True
         if changed and self.on_status_change:
             self.on_status_change(present, healthy, state)
 

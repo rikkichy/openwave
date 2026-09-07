@@ -22,6 +22,17 @@ BREQUEST_WRITE = 0x05
 
 RT_CLASS_IN = 0xA1
 RT_CLASS_OUT = 0x21
+LIBUSB_ERROR_TIMEOUT = -7
+
+
+class DeviceNotReadyError(RuntimeError):
+    """The USB device exists but its ALSA interface is not registered yet."""
+
+
+class DeviceUnresponsiveError(RuntimeError):
+    """The device stopped answering control transfers and needs a power cycle."""
+
+
 
 # --- Raw libusb setup ---
 _lib_path = ctypes.util.find_library("usb-1.0") or "libusb-1.0.so.0"
@@ -47,7 +58,11 @@ _lib.libusb_init(ctypes.byref(_ctx))
 def _find_card(matches):
     """Find the ALSA card number for the device."""
     try:
-        r = subprocess.run(["aplay", "-l"], capture_output=True, text=True, timeout=3)
+        r = subprocess.run(
+            ["aplay", "-l"], capture_output=True, text=True, timeout=3
+        )
+        if r.returncode != 0:
+            return None
         for line in r.stdout.splitlines():
             if any(m in line for m in matches):
                 return line.split(":")[0].split()[-1]
@@ -57,15 +72,15 @@ def _find_card(matches):
 
 
 def _amixer(card, *args):
-    """Run amixer and return stdout."""
+    """Run amixer, returning None when the control interface did not answer."""
     try:
         r = subprocess.run(
             ["amixer", "-c", card, *args],
             capture_output=True, text=True, timeout=3,
         )
-        return r.stdout
+        return r.stdout if r.returncode == 0 else None
     except Exception:
-        return ""
+        return None
 
 
 def _alsa_get(card):
@@ -73,15 +88,17 @@ def _alsa_get(card):
     state = {}
     # Mute (numid=5)
     out = _amixer(card, "cget", "numid=5")
-    state["mute"] = ": values=off" in out
+    if out is not None and ": values=" in out:
+        state["mute"] = ": values=off" in out
     # HP volume (numid=4) — raw ALSA value 0-120
     out = _amixer(card, "cget", "numid=4")
-    for line in out.splitlines():
-        if ": values=" in line:
-            try:
-                state["hp_vol"] = int(line.split("=")[-1])
-            except ValueError:
-                pass
+    if out is not None:
+        for line in out.splitlines():
+            if ": values=" in line:
+                try:
+                    state["hp_vol"] = int(line.split("=")[-1])
+                except ValueError:
+                    pass
     return state
 
 
@@ -137,13 +154,31 @@ class WaveDevice:
 
     def connect(self):
         for profile in PROFILES:
-            handle = _lib.libusb_open_device_with_vid_pid(_ctx, profile.vid, profile.pid)
-            if handle:
-                self._handle = handle
-                self.profile = profile
-                self._card = _find_card(profile.card_match)
-                return
-        raise RuntimeError("No supported Elgato Wave device found")
+            handle = _lib.libusb_open_device_with_vid_pid(
+                _ctx, profile.vid, profile.pid
+            )
+            if not handle:
+                continue
+
+            # snd-usb-audio and OpenWave share endpoint 0. Do not start vendor
+            # transfers while ALSA is still probing the device at login.
+            card = _find_card(profile.card_match)
+            if card is None:
+                _lib.libusb_close(handle)
+                raise DeviceNotReadyError(
+                    f"{profile.display_name} audio interface is not ready"
+                )
+            if _amixer(card, "cget", "numid=5") is None:
+                _lib.libusb_close(handle)
+                raise DeviceUnresponsiveError(
+                    f"{profile.display_name} control interface is not responding"
+                )
+
+            self._handle = handle
+            self.profile = profile
+            self._card = card
+            return
+        raise DeviceNotReadyError("No supported Elgato Wave device found")
 
     def disconnect(self):
         if self._handle:
@@ -161,7 +196,10 @@ class WaveDevice:
                 buf, length, 1000,
             )
         if ret < 0:
-            raise RuntimeError(f"USB read failed (err {ret})")
+            error = f"USB read failed (err {ret})"
+            if ret == LIBUSB_ERROR_TIMEOUT:
+                raise DeviceUnresponsiveError(error)
+            raise RuntimeError(error)
         return bytearray(buf[:ret])
 
     def _ctrl_write(self, wValue, data):
@@ -174,7 +212,10 @@ class WaveDevice:
                 buf, len(data), 1000,
             )
         if ret < 0:
-            raise RuntimeError(f"USB write failed (err {ret})")
+            error = f"USB write failed (err {ret})"
+            if ret == LIBUSB_ERROR_TIMEOUT:
+                raise DeviceUnresponsiveError(error)
+            raise RuntimeError(error)
 
     def read_config(self):
         return self._ctrl_read(self.profile.wvalue_config, self.profile.config_len)
