@@ -10,7 +10,7 @@ Source0:        openwave-%{version}.tar.gz
 Requires:       python3 >= 3.10
 Requires:       python3-gobject
 Requires:       gtk4
-Requires:       libadwaita
+Requires:       libadwaita >= 1.5
 Requires:       adwaita-icon-theme
 Requires:       polkit
 Requires:       libusb1

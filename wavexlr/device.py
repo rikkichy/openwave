@@ -643,5 +643,3 @@ class WaveDevice:
             return
         value = max(0, min(p.mix_max, int(value)))
         self._write_config_value('<H', p.off_monitor_mix, value)
-
-
