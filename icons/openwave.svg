@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48">
+  <!-- Same mark as the symbolic tray icons at 3x, in the palette the matrix
+       already uses: Adwaita blue for the handles, green for a live fader.
+       Both are mid-tone, so the icon holds up on a light and a dark shelf. -->
+  <g fill="none" stroke-width="4.2" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="18.75" y="4.5" width="10.5" height="21" rx="5.25" fill="#3584e4"/>
+    <path d="M24 25.5 V40.2" stroke="#3584e4"/>
+    <path d="M16.8 40.2 H31.2" stroke="#3584e4"/>
+    <path d="M13.2 12.9 Q8.1 21 13.2 29.1" stroke="#33d17a"/>
+    <path d="M34.8 12.9 Q39.9 21 34.8 29.1" stroke="#33d17a"/>
+  </g>
+</svg>

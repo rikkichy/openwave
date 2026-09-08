@@ -1,0 +1,9 @@
+OpenWave is maintained by rikkichy and contributors.
+Project: https://github.com/rikkichy/openwave
+
+The four icons in icons/ and the initial AppStream, RPM, Flatpak and
+release packaging designs were adapted from OpenWave PR #8 by
+Zedwil <nylegarcia01@gmail.com>, reference commit 24940b4.
+Icons are distributed under the project's MIT license (see LICENSE).
+AppStream metadata is distributed under CC0-1.0 as declared in the XML.
+Packaging corrections are subsequent contributions, not solely PR #8 work.

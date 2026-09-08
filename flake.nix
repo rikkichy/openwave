@@ -19,19 +19,20 @@
           runtimeBins = pkgs.lib.makeBinPath [
             pkgs.alsa-utils
             pkgs.pipewire
-            pkgs.procps
+            pkgs.wireplumber
             pkgs.pulseaudio
           ];
         in
         rec {
           openwave = pkgs.stdenv.mkDerivation {
             pname = "openwave";
-            version = "1.0.0";
+            version = pkgs.lib.removeSuffix "\n" (builtins.readFile ./VERSION);
             src = self;
 
             nativeBuildInputs = with pkgs; [
               makeWrapper
               wrapGAppsHook4
+              pythonEnv
               gobject-introspection
             ];
             buildInputs = with pkgs; [
@@ -40,9 +41,8 @@
             ];
 
             dontBuild = true;
-            # The Makefile derives SITEPKG from the interpreter, which is
-            # a read-only store path here -- override it onto $out and
-            # point the generated launcher at the pygobject python.
+            # Keep the module tree under this output and use the interpreter
+            # carrying PyGObject; both launchers retain runtime tool paths.
             installFlags = [
               "PREFIX=${placeholder "out"}"
               "SITEPKG=${placeholder "out"}/${sitePkgs}"
@@ -62,13 +62,6 @@
               PYTHONPATH="$out/${sitePkgs}" ${pythonEnv}/bin/python3 -c \
                 'from wavexlr.setup import UDEV_RULES; print(*UDEV_RULES, sep="\n")' \
                 > $out/lib/udev/rules.d/99-openwave.rules
-
-              # setup.py looks for the WirePlumber and mix-sink configs next to
-              # the source tree, then under /usr/local and /usr. The Makefile put
-              # them in $out/share/openwave, so on Nix all three candidates miss
-              # and run_setup() dies with "WirePlumber rule source not found".
-              # Retarget the FHS prefix at the real one; $out/share/openwave is
-              # simply what PREFIX=/usr would have produced here.
             '';
 
             # ctypes needs to find libusb; the module tree needs to be on
@@ -79,6 +72,8 @@
                 --prefix PYTHONPATH : $out/${sitePkgs} \
                 --prefix LD_LIBRARY_PATH : ${usbLibs} \
                 --prefix PATH : ${runtimeBins} \
+                --prefix LADSPA_PATH : ${pkgs.swh-plugins}/lib/ladspa \
+                --prefix XDG_DATA_DIRS : ${pkgs.adwaita-icon-theme}/share \
                 "''${gappsWrapperArgs[@]}"
 
               # The Makefile installs this launcher too; it just needs the same
@@ -86,7 +81,8 @@
               wrapProgram $out/bin/openwave-daemon \
                 --prefix PYTHONPATH : $out/${sitePkgs} \
                 --prefix LD_LIBRARY_PATH : ${usbLibs} \
-                --prefix PATH : ${runtimeBins}
+                --prefix PATH : ${runtimeBins} \
+                --prefix LADSPA_PATH : ${pkgs.swh-plugins}/lib/ladspa
             '';
 
             meta = {
