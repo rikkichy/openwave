@@ -5,6 +5,7 @@ import tempfile
 import unittest
 
 from wavexlr import scenes
+from wavexlr.mixer import Mixer
 
 
 class SceneStoreTests(unittest.TestCase):
@@ -114,6 +115,49 @@ class SceneStoreTests(unittest.TestCase):
             scenes.put("Power", payload, self.path)
         self.assertEqual(payload, original)
         self.assertFalse(self.path.exists())
+
+
+class SceneRecallTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.path = Path(directory.name) / "matrix.json"
+        self.mixer = Mixer(config_path=str(self.path))
+        self.addCleanup(self.mixer.stop)
+        self.mixer.set_mixes({"bus": {"name": "Broadcast", "sink": "openwave_bus"}})
+        self.mixer.set_sources({
+            "primary": {"group": "voice", "level": 0.7},
+            "backup": {"group": "voice", "muted": True},
+        })
+
+    def test_partial_recall_preserves_topology_and_group_exclusion(self):
+        skipped = self.mixer.apply_scene({
+            "sources": {"backup": {"muted": False, "level": 0.4}, "missing": {"level": 1}},
+            "cells": {"backup.bus": {"volume": 0.6}, "missing.bus": {"volume": 1}},
+            "outputs": {"bus": "unplugged_headphones"},
+            "volumes": {"bus": {"volume": 0.3, "muted": True}},
+        })
+        state = self.mixer.scene_state()
+        self.assertEqual(set(state["sources"]), {"primary", "backup"})
+        self.assertTrue(state["sources"]["primary"]["muted"])
+        self.assertEqual(state["sources"]["backup"], {"level": 0.4, "muted": False})
+        self.assertEqual(state["cells"]["backup.bus"], {"volume": 0.6, "muted": False})
+        self.assertEqual(set(state["cells"]), {"primary.bus", "backup.bus"})
+        self.assertEqual(state["volumes"]["bus"], {"volume": 0.3, "muted": True})
+        self.assertIsNone(self.mixer.resolve_output("bus", sinks=[]))
+        self.assertEqual(self.mixer.get_output("bus"), "unplugged_headphones")
+        self.assertIn("missing", " ".join(skipped))
+
+    def test_invalid_recall_cannot_apply_an_earlier_valid_section(self):
+        before = self.mixer.scene_state()
+        persisted = self.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.mixer.apply_scene({
+                "sources": {"primary": {"level": 0}},
+                "volumes": {"bus": {"volume": float("nan")}},
+            })
+        self.assertEqual(self.mixer.scene_state(), before)
+        self.assertEqual(self.path.read_bytes(), persisted)
 
 
 class HardwareEntryTests(unittest.TestCase):

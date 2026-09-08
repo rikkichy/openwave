@@ -40,7 +40,7 @@ def _number(value, low, high, label, *, integer=False):
         raise ValueError(f"{label} must be a finite number in [{low}, {high}]")
 
 
-def _validate(scenes):
+def validate(scenes):
     _mapping(scenes, "scenes")
     sections = {"sources", "cells", "outputs", "volumes", "hardware"}
     hardware_fields = {
@@ -97,7 +97,7 @@ def load(path=None):
             data = json.load(file)
         if not isinstance(data, dict) or set(data) != {"scenes"}:
             raise ValueError("top-level shape must be {'scenes': {...}}")
-        _validate(data["scenes"])
+        validate(data["scenes"])
         return data["scenes"]
     except FileNotFoundError:
         return {}
@@ -107,7 +107,7 @@ def load(path=None):
 
 def save(scenes, path=None):
     """Validate and atomically replace the store; invalid payloads raise ValueError."""
-    _validate(scenes)
+    validate(scenes)
     path = os.fspath(CONFIG_PATH if path is None else path)
     directory = os.path.dirname(path) or "."
     os.makedirs(directory, exist_ok=True)
