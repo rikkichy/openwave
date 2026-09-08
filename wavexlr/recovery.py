@@ -126,7 +126,7 @@ def cycle_card(card_name, runner=None):
 
 
 class StallWatch:
-    """Pure no-data capture decision; silence/mute is not evidence of a stall."""
+    """No-data decisions and the shared budget for capture-card remedies."""
 
     def __init__(self, stall_seconds=STALL_SECONDS,
                  cooldown_seconds=COOLDOWN_SECONDS, max_attempts=MAX_ATTEMPTS,
@@ -143,6 +143,19 @@ class StallWatch:
         for state in (self._attempts, self._last_attempt, self._clean_since):
             state.pop(node_name, None)
 
+    def pause(self, node_name):
+        """Unknown or unhealthy data ends the clean interval, not the budget."""
+        self._clean_since.pop(node_name, None)
+
+    def spent(self, node_name):
+        return self._attempts.get(node_name, 0)
+
+    def can_recover(self, node_name, now):
+        if self.spent(node_name) >= self.max_attempts:
+            return False
+        last = self._last_attempt.get(node_name)
+        return last is None or now - last >= self.cooldown_seconds
+
     def should_recover(self, node_name, node_present, silent_for, now):
         if not node_present or node_name is None:
             self._clean_since.pop(node_name, None)
@@ -152,11 +165,8 @@ class StallWatch:
             return False
         if silent_for < self.stall_seconds:
             return False
-        self._clean_since.pop(node_name, None)
-        if self._attempts.get(node_name, 0) >= self.max_attempts:
-            return False
-        last = self._last_attempt.get(node_name)
-        return last is None or now - last >= self.cooldown_seconds
+        self.pause(node_name)
+        return self.can_recover(node_name, now)
 
     def record_attempt(self, node_name, now):
         self._attempts[node_name] = self._attempts.get(node_name, 0) + 1

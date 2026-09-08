@@ -49,7 +49,7 @@ def main(argv=None):
             log.warning("Establishing capture keepalive...")
 
     manager = AudioManager(on_status_change=on_status)
-    health = HealthMonitor(auto_recover=args.auto_recover)
+    health = HealthMonitor(auto_recover=args.auto_recover, capture_gaps=manager.capture_gaps)
     previous = {sig: signal.signal(sig, shutdown)
                 for sig in (signal.SIGTERM, signal.SIGINT)}
 

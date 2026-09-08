@@ -132,6 +132,17 @@ class MeterMonitor:
                 return None
             return time.monotonic() - state.last_data
 
+    def capture_gaps(self):
+        """Shortest live tap gap per node; another flowing tap disproves a stall."""
+        with self._lock:
+            now = time.monotonic()
+            gaps = {}
+            for source_id, state in self._meters.items():
+                if self.running(source_id):
+                    age = now - state.last_data
+                    gaps[state.node_name] = min(gaps.get(state.node_name, age), age)
+            return gaps
+
     def _reader(self, source_id, node_name, capture_sink, state):
         proc = None
         try:

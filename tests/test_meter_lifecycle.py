@@ -138,6 +138,20 @@ class MeterLifecycleTests(unittest.TestCase):
         self.monitor.stop_all()
         self.assertIsNone(self.monitor.silent_for("mic"))
 
+    def test_one_flowing_tap_disproves_a_shared_capture_stall(self):
+        clock = [10.0]
+        self.module.time = types.SimpleNamespace(monotonic=lambda: clock[0])
+        self.monitor.start("flowing", "capture", lambda _peak: None)
+        self.await_condition(lambda: self.monitor.running("flowing"))
+        self.monitor.start("stalled", "capture", lambda _peak: None)
+        self.await_condition(lambda: self.monitor.running("stalled"))
+        clock[0] = 20.0
+        self.processes[0].stdin.write(b"\x00\x00" * 512)
+        self.await_condition(lambda: self.monitor.capture_gaps() == {"capture": 0.0})
+        self.assertEqual(self.monitor.silent_for("stalled"), 10.0)
+        self.monitor.stop("flowing")
+        self.assertEqual(self.monitor.capture_gaps(), {"capture": 10.0})
+
     def test_cancel_during_spawn_still_closes_pipe_and_reaps_child(self):
         entered, release = threading.Event(), threading.Event()
         original_spawn = self.spawn

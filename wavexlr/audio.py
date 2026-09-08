@@ -42,6 +42,8 @@ import threading
 import time
 import logging
 
+from . import child
+
 log = logging.getLogger("wavexlr.audio")
 
 # Every Wave family capture node. Two stems, not one "Elgato_" prefix,
@@ -187,6 +189,7 @@ class _Pin:
         self._proc = None
         self._reader = None
         self._last_data_at = 0.0
+        self._last_flow_at = 0.0
         self._last_signal_at = 0.0
         self._started_at = 0.0
         self._silence_recycles = 0
@@ -199,9 +202,11 @@ class _Pin:
         self.kill()
         now = time.monotonic()
         self._last_data_at = now
+        if not self._last_flow_at:
+            self._last_flow_at = now
         self._last_signal_at = now
         self._started_at = now
-        self._proc = subprocess.Popen(
+        self._proc = child.spawn(
             [
                 "pw-cat", "--record",
                 "--target", self.source_name,
@@ -214,6 +219,8 @@ class _Pin:
                     "node.description": "OpenWave capture keepalive",
                     "media.name": f"OpenWave keepalive: {self.source_name}",
                     "application.name": "OpenWave",
+                    "node.dont-fallback": True,
+                    "node.dont-move": True,
                 }),
                 "-",
             ],
@@ -236,25 +243,20 @@ class _Pin:
         proc, reader = self._proc, self._reader
         self._proc = None
         self._reader = None
-        if proc and proc.poll() is None:
-            try:
+        if proc is not None:
+            if proc.poll() is None:
                 proc.terminate()
-                proc.wait(timeout=SIGTERM_GRACE)
-            except subprocess.TimeoutExpired:
-                # Wedged streams sometimes ignore SIGTERM — kill the
-                # whole process group to be sure.
                 try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    proc.kill()
-                try:
-                    proc.wait(timeout=1)
+                    proc.wait(timeout=SIGTERM_GRACE)
                 except subprocess.TimeoutExpired:
-                    pass
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        proc.kill()
+            proc.wait()
             log.info(f"Stopped capture keepalive for {self.source_name}")
-        # Reader thread exits when the pipe closes.
-        if reader and reader.is_alive():
-            reader.join(timeout=2)
+        if reader is not None:
+            reader.join()
 
     def _drain(self, proc):
         """Drain pw-cat's stdout, updating the last-data-received timestamp.
@@ -271,6 +273,7 @@ class _Pin:
                 if self._proc is proc:
                     now = time.monotonic()
                     self._last_data_at = now
+                    self._last_flow_at = now
                     if chunk.count(0) != len(chunk):
                         self._last_signal_at = now
         except Exception:
@@ -284,7 +287,8 @@ class _Pin:
     # --- health ---
 
     def _alive(self):
-        return self._proc is not None and self._proc.poll() is None
+        proc = self._proc
+        return proc is not None and proc.poll() is None
 
     def _data_flowing(self):
         return (time.monotonic() - self._last_data_at) < WEDGE_TIMEOUT
@@ -371,6 +375,7 @@ class AudioManager:
         self._running = False
         self._loop_thread = None
         self._pins = {}  # source node name -> _Pin
+        self._capture_pins = ()
         self._stop = threading.Event()
         self._absent_retry = ABSENT_RETRY_INITIAL
         self._status_reported = False
@@ -391,6 +396,13 @@ class AudioManager:
     @property
     def device_present(self):
         return self._device_present
+
+    def capture_gaps(self):
+        """Live byte ages across owned tap restarts, excluding startup and exits."""
+        now = time.monotonic()
+        return {pin.source_name: now - pin._last_flow_at
+                for pin in self._capture_pins
+                if pin._alive() and now - pin._started_at >= STARTUP_GRACE}
 
     def start(self):
         if self._running:
@@ -440,8 +452,9 @@ class AudioManager:
                             break
                         if name not in self._pins:
                             self._pins[name] = _Pin(name)
+                    self._capture_pins = tuple(self._pins.values())
                     states = []
-                    for pin in self._pins.values():
+                    for pin in self._capture_pins:
                         if self._stop.is_set():
                             break
                         states.append(pin.step())
@@ -461,3 +474,4 @@ class AudioManager:
             for pin in self._pins.values():
                 pin.kill()
             self._pins.clear()
+            self._capture_pins = ()

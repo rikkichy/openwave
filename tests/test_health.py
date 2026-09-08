@@ -6,6 +6,7 @@ audio that every layer reports as healthy, and acting too eagerly cycles
 hardware underneath someone who is using it.
 """
 
+import json
 import threading
 import unittest
 from unittest import mock
@@ -47,16 +48,39 @@ class ParsingPwTop(unittest.TestCase):
         self.assertNotIn("FORMAT", counts)
 
 
+class WatchedOutputs(unittest.TestCase):
+    def test_follows_real_output_links_not_target_hints_or_capture_legs(self):
+        def node(ident, name, media_class, **props):
+            return {"id": ident, "type": "PipeWire:Interface:Node",
+                    "info": {"state": "running",
+                             "props": {"node.name": name, "media.class": media_class, **props}}}
+
+        def link(source, target):
+            return {"type": "PipeWire:Interface:Link",
+                    "info": {"output-node-id": source, "input-node-id": target}}
+
+        alsa = {"api.alsa.pcm.card": 0, "api.alsa.pcm.device": 1}
+        dump = [
+            node(1, DOCK, "Audio/Source"),
+            node(2, SINK, "Audio/Sink", **alsa),
+            node(3, "alsa_output.unrelated", "Audio/Sink", **alsa),
+            node(4, "openwave_loop_output_personal_cap", "Stream/Input/Audio"),
+            node(5, "openwave_loop_output_personal", "Stream/Output/Audio",
+                 **{"target.object": "alsa_output.unrelated"}),
+            node(6, "unrelated_player", "Stream/Output/Audio"),
+            link(5, 2), link(4, 3), link(6, 3),
+        ]
+        captures, sinks = health.snapshot_graph(mock.Mock(run=lambda _args: json.dumps(dump)))
+        self.assertEqual(captures, {DOCK: True})
+        self.assertEqual(sinks, {SINK: {"running": True, "card": 0, "device": 1, "subdevice": 0}})
+
+
 class GlitchDeciding(unittest.TestCase):
     def setUp(self):
-        self.w = health.GlitchWatch(
-            threshold=50, confirm=2, cooldown_seconds=60, max_attempts=2)
+        self.w = health.GlitchWatch(threshold=50, confirm=2)
 
-    def feed(self, counts, start=0.0, step=10.0):
-        verdicts = []
-        for i, c in enumerate(counts):
-            verdicts.append(self.w.observe(DOCK, c, start + i * step))
-        return verdicts
+    def feed(self, counts):
+        return [self.w.observe(DOCK, count) for count in counts]
 
     def test_first_sight_only_baselines(self):
         """A node first seen with a huge historical count has not been
@@ -72,7 +96,6 @@ class GlitchDeciding(unittest.TestCase):
         # ~23 xruns/s over 10 s windows, as measured on hardware.
         self.feed([0, 230, 460])
         self.assertTrue(self.w.glitching(DOCK))
-        self.assertTrue(self.w.should_recover(DOCK, now=100.0))
 
     def test_one_burst_is_an_event_not_a_state(self):
         """A single bad window (game launch, compile) must not cycle a
@@ -92,84 +115,19 @@ class GlitchDeciding(unittest.TestCase):
         self.feed([30000, 30230, 5])
         self.assertFalse(self.w.glitching(DOCK))
 
-    def test_attempts_are_capped(self):
-        self.feed([0, 230, 460])
-        self.w.record_attempt(DOCK, 20.0)
-        self.feed([690, 920], start=100.0)
-        self.w.record_attempt(DOCK, 120.0)
-        self.feed([1150, 1380], start=300.0)
-        self.assertFalse(self.w.should_recover(DOCK, now=400.0))
-
-    def test_cooldown_blocks_a_rapid_second_attempt(self):
-        self.feed([0, 230, 460])
-        self.w.record_attempt(DOCK, 20.0)
-        self.feed([690], start=30.0)
-        self.assertFalse(self.w.should_recover(DOCK, now=30.0))
-        self.assertTrue(self.w.should_recover(DOCK, now=90.0))
-
-    def test_one_clean_window_does_not_refill_the_budget(self):
-        """The loop observed on hardware: a card cycle buys a quiet
-        window while the capture reopens, the refill re-arms, and a
-        persistent fault becomes a pop every two minutes. One quiet
-        window is the incident still going, not recovery."""
-        w = health.GlitchWatch(threshold=50, confirm=2,
-                               cooldown_seconds=60, max_attempts=2,
-                               clean_refill=3)
-        for i, c in enumerate([0, 230, 460]):
-            w.observe(DOCK, c, i * 10.0)
-        w.record_attempt(DOCK, 20.0)
-        w.record_attempt(DOCK, 90.0)
-        w.observe(DOCK, 461, 100.0)            # one quiet window
-        for i, c in enumerate([700, 940, 1180]):
-            w.observe(DOCK, c, 200.0 + i * 10.0)
-        self.assertFalse(w.should_recover(DOCK, now=300.0))
-
-    def test_sustained_quiet_refills_the_budget(self):
-        """Recovery is per incident, not per process lifetime — but the
-        incident has to actually end first."""
-        w = health.GlitchWatch(threshold=50, confirm=2,
-                               cooldown_seconds=60, max_attempts=2,
-                               clean_refill=3)
-        for i, c in enumerate([0, 230, 460]):
-            w.observe(DOCK, c, i * 10.0)
-        w.record_attempt(DOCK, 20.0)
-        w.record_attempt(DOCK, 90.0)
-        for i, c in enumerate([461, 462, 463]):  # sustained quiet
-            w.observe(DOCK, c, 100.0 + i * 10.0)
-        for i, c in enumerate([700, 940, 1180]):  # a fresh incident
-            w.observe(DOCK, c, 300.0 + i * 10.0)
-        self.assertTrue(w.should_recover(DOCK, now=400.0))
-
-    def test_a_post_cycle_counter_reset_is_not_a_clean_window(self):
-        """The reset after a card cycle proves nothing about the fault;
-        counting it toward refill would shave a window off the leash."""
-        w = health.GlitchWatch(threshold=50, confirm=2,
-                               cooldown_seconds=60, max_attempts=2,
-                               clean_refill=2)
-        for i, c in enumerate([0, 230, 460]):
-            w.observe(DOCK, c, i * 10.0)
-        w.record_attempt(DOCK, 20.0)
-        w.record_attempt(DOCK, 90.0)
-        w.observe(DOCK, 5, 100.0)     # recreated: baseline, not clean
-        w.observe(DOCK, 6, 110.0)     # one genuinely clean window
-        for i, c in enumerate([200, 440, 680]):
-            w.observe(DOCK, c, 200.0 + i * 10.0)
-        self.assertFalse(w.should_recover(DOCK, now=300.0))
-
     def test_confirmation_fires_exactly_once_per_incident(self):
         """The window that crosses `confirm` is the one to log; every
         later glitchy window would repeat the same warning every 10 s
         for the life of the fault."""
         self.feed([0, 230, 460])
         self.assertTrue(self.w.just_confirmed(DOCK))
-        self.feed([690], start=100.0)
+        self.feed([690])
         self.assertFalse(self.w.just_confirmed(DOCK))
         self.assertTrue(self.w.glitching(DOCK))
 
-    def test_forget_starts_clean(self):
+    def test_pause_requires_a_new_baseline(self):
         self.feed([0, 230, 460])
-        self.w.record_attempt(DOCK, 20.0)
-        self.w.forget(DOCK)
+        self.w.pause(DOCK)
         self.assertEqual(self.feed([9000]), [False])
         self.assertFalse(self.w.glitching(DOCK))
 
@@ -313,6 +271,48 @@ class MonitorBehavior(unittest.TestCase):
         self.feed(monitor, [0, 230, 460, 690, 920, 1150, 1380])
         self.assertEqual(self.cycle.call_count, 2)
         self.assertEqual(self.recycle.call_count, 2)
+
+    def test_no_data_and_xruns_share_one_card_budget_and_cooldown(self):
+        gaps = {DOCK: 9}
+        monitor = health.HealthMonitor(auto_recover=True, capture_gaps=lambda: gaps)
+        self.feed(monitor, [0], 0)
+        self.assertEqual(self.cycle.call_count, 1)
+        gaps[DOCK] = 0
+        with mock.patch.object(health, "sample_xruns", return_value={DOCK: 230}):
+            monitor.check_once(10)
+        with mock.patch.object(health, "sample_xruns", return_value={DOCK: 460}):
+            monitor.check_once(20)
+        self.assertEqual(self.cycle.call_count, 1)
+        self.feed(monitor, [690], 60)
+        self.assertEqual(self.cycle.call_count, 2)
+        gaps[DOCK] = 90
+        self.feed(monitor, [690, 690], 300)
+        self.assertEqual(self.cycle.call_count, 2)
+
+    def test_refill_requires_healthy_bytes_and_xruns_for_five_minutes(self):
+        gaps = {DOCK: 0}
+        monitor = health.HealthMonitor(auto_recover=True, capture_gaps=lambda: gaps)
+        self.feed(monitor, [0, 230, 460, 690])
+        self.assertEqual(self.cycle.call_count, 2)
+        self.feed(monitor, [690], 300)
+        self.feed(monitor, [690], 599)
+        gaps[DOCK] = 9
+        self.feed(monitor, [690], 600)
+        self.assertEqual(self.cycle.call_count, 2)
+        gaps[DOCK] = 0
+        self.feed(monitor, [690], 700)
+        self.feed(monitor, [690], 1000)
+        gaps[DOCK] = 9
+        self.feed(monitor, [690], 1001)
+        self.assertEqual(self.cycle.call_count, 3)
+
+    def test_counter_recreation_does_not_start_the_clean_interval(self):
+        monitor = health.HealthMonitor(auto_recover=True, capture_gaps=lambda: {DOCK: 0})
+        self.feed(monitor, [0, 230, 460, 690])
+        self.feed(monitor, [0], 300)
+        self.feed(monitor, [1], 600)
+        self.feed(monitor, [231, 461], 601)
+        self.assertEqual(self.cycle.call_count, 2)
 
     def test_muted_idle_or_unknown_capture_needs_a_new_baseline(self):
         monitor = health.HealthMonitor(auto_recover=True)
