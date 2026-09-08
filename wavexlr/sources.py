@@ -8,7 +8,7 @@ import re
 import tempfile
 import uuid
 
-CONFIG_PATH = os.path.expanduser("~/.config/openwave/sources.json")
+CONFIG_PATH = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "openwave", "sources.json")
 KIND_APP = "app"
 KIND_DEVICE = "device"
 DEFAULT_APP_ICON = "applications-multimedia-symbolic"

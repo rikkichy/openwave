@@ -1,4 +1,5 @@
 import copy
+import json
 import subprocess
 import tempfile
 import threading
@@ -6,7 +7,7 @@ import time
 import unittest
 from pathlib import Path
 
-from wavexlr.mixer import Mixer, claim_streams, SubprocessPipeWire
+from wavexlr.mixer import Mixer, claim_streams, SubprocessPipeWire, mix_capture_name
 
 
 class Child:
@@ -69,6 +70,11 @@ class PipeWire:
         self.graph["sinks"].pop(handle[1], None)
         return True
 
+    def remove_mix_sink(self, name, graph):
+        self.graph["sinks"].pop(name, None)
+        self.graph["nodes"].pop(name, None)
+        return True
+
     def spawn_loopback(self, name, **kwargs):
         self.node(name)
         self.node(name + "_cap")
@@ -107,6 +113,20 @@ class PipeWire:
                                        "sink": "headphones", "app_name": "Music", "node_name": "Music"}
         return ident
 
+    def has_route(self, source, target, level=None):
+        nodes, edges = self.graph["nodes"], self.graph["links"]
+        if source not in nodes or target not in nodes:
+            return False
+        source_port, target_port = nodes[source]["id"] + 2, nodes[target]["id"] + 1
+        for child in self.children:
+            if child.dead or any(name not in nodes for name in child.names):
+                continue
+            playback, capture = (nodes[name]["id"] for name in child.names)
+            if (source_port, capture + 1) in edges and (playback + 2, target_port) in edges:
+                if level is None or self.levels.get(playback) == level:
+                    return True
+        return False
+
 
 def eventually(predicate):
     deadline = time.monotonic() + 3
@@ -136,11 +156,11 @@ class RoutingTests(unittest.TestCase):
             mixer.set_cell("music", "chat", 0.6, False)
             mixer.start()
             try:
-                eventually(lambda: pw.graph["streams"][sid]["sink"] == "openwave_src_music" and len(pw.graph["links"]) >= 2)
-                self.assertIn((0.3, False), pw.levels.values())
+                eventually(lambda: pw.graph["streams"][sid]["sink"] == "openwave_src_music"
+                           and pw.has_route("openwave_src_music", "openwave_chat_mix", (0.3, False)))
                 self.assertTrue(all(thread == "openwave-mixer" for _, thread in pw.operations))
                 mixer.set_cell("music", "chat", 0, False)
-                eventually(lambda: all(child.dead for child in pw.children))
+                eventually(lambda: not pw.has_route("openwave_src_music", "openwave_chat_mix"))
                 self.assertEqual(pw.graph["streams"][sid]["sink"], "openwave_src_music")
             finally:
                 mixer.stop()
@@ -170,6 +190,75 @@ class RoutingTests(unittest.TestCase):
             self.assertFalse(pw.link(1, 2))
             self.assertFalse(pw.move_stream({"pulse_id": 4}, "sink"))
             self.assertFalse(pw.set_level(4, 0.2, False))
+
+    def test_recreated_master_restores_before_observing_unity(self):
+        pw = PipeWire()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "mixes.json"
+            path.write_text(json.dumps({"volumes": {"chat": {"volume": 0.25, "muted": True}}}))
+            mixer = Mixer(pw, config_path=str(path), poll_interval=0.005)
+            mixer.start()
+            try:
+                eventually(lambda: mixer.volumes_restored)
+                self.assertEqual(pw.graph["sinks"]["openwave_chat_mix"]["volume"], 0.25)
+                pw.fail_levels = 3
+                pw.sink("openwave_chat_mix", 1.0)
+                eventually(lambda: pw.graph["sinks"]["openwave_chat_mix"]["volume"] == 0.25)
+                self.assertEqual(mixer.mix_volume("chat"), (0.25, True))
+            finally:
+                mixer.stop()
+            self.assertEqual(json.loads(path.read_text())["volumes"]["chat"], {"volume": 0.25, "muted": True})
+
+    def test_dynamic_outputs_publish_capture_and_stop_owned_children(self):
+        pw = PipeWire()
+        with tempfile.TemporaryDirectory() as directory:
+            mixer = Mixer(pw, config_path=str(Path(directory) / "mixes.json"),
+                          mixes_config_path=str(Path(directory) / "mixes.conf"), poll_interval=0.005)
+            mixer.set_mixes({"broadcast": {"name": "Broadcast", "sink": "openwave_mix_broadcast"}})
+            mixer.set_output("broadcast", "headphones")
+            mixer.start()
+            try:
+                eventually(lambda: pw.has_route("openwave_mix_broadcast", "headphones")
+                           and mix_capture_name("broadcast") in pw.graph["nodes"])
+                self.assertEqual(mixer.resolve_output("broadcast"), "headphones")
+                mixer.set_output("broadcast", "unplugged")
+                eventually(lambda: not pw.has_route("openwave_mix_broadcast", "headphones"))
+                self.assertIsNone(mixer.resolve_output("broadcast"))
+                mixer.remove_mix("broadcast")
+                eventually(lambda: mix_capture_name("broadcast") not in pw.graph["nodes"]
+                           and "openwave_mix_broadcast" not in pw.graph["sinks"])
+            finally:
+                mixer.stop()
+            self.assertTrue(all(child.dead for child in pw.children))
+            self.assertIn("headphones", pw.graph["sinks"])
+
+    def test_reused_module_id_does_not_authorize_deletion(self):
+        from unittest.mock import patch
+        pw = SubprocessPipeWire()
+        graph = {"modules": [{"index": 8, "argument": "openwave.owner=someone-else"}]}
+        with patch("wavexlr.mixer.subprocess.run", side_effect=AssertionError("Unrelated resource touched")):
+            self.assertTrue(pw.destroy_sink((8, "our-token"), graph))
+
+    def test_duplicate_stream_names_remain_independently_claimable(self):
+        objects = [{"id": index, "type": "PipeWire:Interface:Node",
+                    "info": {"props": {"node.name": "Player", "object.serial": index + 100,
+                                       "media.class": "Stream/Output/Audio", "application.name": "Player"}}}
+                   for index in (11, 12)]
+
+        class DuplicateStreams(SubprocessPipeWire):
+            def run(self, argv):
+                if argv == ["pw-dump"]:
+                    return json.dumps(objects)
+                if argv == ["pactl", "get-default-sink"]:
+                    return "headphones"
+                if argv[-1] == "sink-inputs":
+                    return json.dumps([{"index": index, "properties": {"object.serial": index + 100}}
+                                       for index in (11, 12)])
+                return "[]"
+
+        graph = DuplicateStreams().snapshot()
+        self.assertEqual(claim_streams({"player": {"match_app_names": ["Player"]}}, graph["streams"]),
+                         {"player": {11, 12}})
 
     @staticmethod
     def reconcile(mixer, pw):
@@ -229,3 +318,31 @@ class RoutingTests(unittest.TestCase):
                     pw.fail_moves = 0
                     mixer._teardown()
                     mixer.stop()
+
+    def test_successful_master_change_preserves_publication_and_route_identity(self):
+        pw = PipeWire()
+        pw.stream()
+        with tempfile.TemporaryDirectory() as directory:
+            mixer = Mixer(pw, config_path=str(Path(directory) / "mixes.json"))
+            try:
+                mixer.set_sources({"music": {"name": "Music", "match_app_names": ["Music"]}})
+                mixer.set_cell("music", "personal", 0.6, False)
+                for _ in range(3):
+                    self.reconcile(mixer, pw)
+                self.assertTrue(pw.has_route("openwave_src_music", "openwave_personal_mix"))
+                self.assertTrue(pw.has_route("openwave_personal_mix", "headphones"))
+                self.assertIn(mix_capture_name("personal"), pw.graph["nodes"])
+                identities = {name: node["serial"] for name, node in pw.graph["nodes"].items()}
+
+                mixer.set_mix_volume("personal", 0.4, True)
+                for _ in range(2):
+                    self.reconcile(mixer, pw)
+                    self.assertEqual({name: node["serial"] for name, node in pw.graph["nodes"].items()},
+                                     identities)
+                    self.assertTrue(pw.has_route("openwave_src_music", "openwave_personal_mix"))
+                    self.assertTrue(pw.has_route("openwave_personal_mix", "headphones"))
+                self.assertEqual(pw.graph["sinks"]["openwave_personal_mix"]["volume"], 0.4)
+                self.assertTrue(pw.graph["sinks"]["openwave_personal_mix"]["muted"])
+            finally:
+                mixer._teardown()
+                mixer.stop()
