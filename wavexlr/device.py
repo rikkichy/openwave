@@ -17,6 +17,7 @@ import re
 import struct
 import subprocess
 import threading
+import time
 
 from .profiles import PROFILES
 
@@ -43,8 +44,6 @@ _lib = ctypes.CDLL(_lib_path)
 
 _lib.libusb_init.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
 _lib.libusb_init.restype = ctypes.c_int
-_lib.libusb_open_device_with_vid_pid.argtypes = [ctypes.c_void_p, ctypes.c_uint16, ctypes.c_uint16]
-_lib.libusb_open_device_with_vid_pid.restype = ctypes.c_void_p
 _lib.libusb_close.argtypes = [ctypes.c_void_p]
 _lib.libusb_close.restype = None
 _lib.libusb_control_transfer.argtypes = [
@@ -53,9 +52,81 @@ _lib.libusb_control_transfer.argtypes = [
     ctypes.POINTER(ctypes.c_ubyte), ctypes.c_uint16, ctypes.c_uint,
 ]
 _lib.libusb_control_transfer.restype = ctypes.c_int
+_lib.libusb_get_device_list.argtypes = [
+    ctypes.c_void_p, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))
+]
+_lib.libusb_get_device_list.restype = ctypes.c_ssize_t
+_lib.libusb_free_device_list.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_int]
+_lib.libusb_free_device_list.restype = None
+_lib.libusb_get_bus_number.argtypes = [ctypes.c_void_p]
+_lib.libusb_get_bus_number.restype = ctypes.c_uint8
+_lib.libusb_get_device_address.argtypes = [ctypes.c_void_p]
+_lib.libusb_get_device_address.restype = ctypes.c_uint8
+_lib.libusb_open.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+_lib.libusb_open.restype = ctypes.c_int
+
+
+class _DeviceDescriptor(ctypes.Structure):
+    _fields_ = [
+        ("bLength", ctypes.c_uint8),
+        ("bDescriptorType", ctypes.c_uint8),
+        ("bcdUSB", ctypes.c_uint16),
+        ("bDeviceClass", ctypes.c_uint8),
+        ("bDeviceSubClass", ctypes.c_uint8),
+        ("bDeviceProtocol", ctypes.c_uint8),
+        ("bMaxPacketSize0", ctypes.c_uint8),
+        ("idVendor", ctypes.c_uint16),
+        ("idProduct", ctypes.c_uint16),
+        ("bcdDevice", ctypes.c_uint16),
+        ("iManufacturer", ctypes.c_uint8),
+        ("iProduct", ctypes.c_uint8),
+        ("iSerialNumber", ctypes.c_uint8),
+        ("bNumConfigurations", ctypes.c_uint8),
+    ]
+
+
+_lib.libusb_get_device_descriptor.argtypes = [
+    ctypes.c_void_p, ctypes.POINTER(_DeviceDescriptor)
+]
+_lib.libusb_get_device_descriptor.restype = ctypes.c_int
 
 _ctx = ctypes.c_void_p()
 _lib.libusb_init(ctypes.byref(_ctx))
+
+
+def _each_usb_device(visit):
+    """Visit devices while their enumeration references remain valid."""
+    devices = ctypes.POINTER(ctypes.c_void_p)()
+    count = _lib.libusb_get_device_list(_ctx, ctypes.byref(devices))
+    if count < 0:
+        raise RuntimeError(f"USB enumeration failed (err {count})")
+    try:
+        descriptor = _DeviceDescriptor()
+        for index in range(count):
+            dev = devices[index]
+            if _lib.libusb_get_device_descriptor(dev, ctypes.byref(descriptor)):
+                continue
+            visit(
+                descriptor.idVendor, descriptor.idProduct,
+                _lib.libusb_get_bus_number(dev),
+                _lib.libusb_get_device_address(dev), dev,
+            )
+    finally:
+        _lib.libusb_free_device_list(devices, 1)
+
+
+def scan():
+    """Return every supported (profile, bus, address), including duplicates."""
+    profiles = {(profile.vid, profile.pid): profile for profile in PROFILES}
+    found = []
+
+    def visit(vid, pid, bus, addr, _dev):
+        profile = profiles.get((vid, pid))
+        if profile is not None:
+            found.append((profile, bus, addr))
+
+    _each_usb_device(visit)
+    return sorted(found, key=lambda entry: (entry[1], entry[2]))
 
 
 def _find_card(matches, *, vid=None, pid=None, usbbus=None):
@@ -86,6 +157,8 @@ def _find_card(matches, *, vid=None, pid=None, usbbus=None):
                 return card_dir[4:]
         if readable:
             return None
+    if usbbus is not None:
+        return None
 
     # Older kernels may not expose /proc/asound/card*/usbid. Only that case
     # falls back to product-name matching, which cannot distinguish duplicates.
@@ -178,8 +251,9 @@ def _forget_alsa_card(card):
     if card is None:
         return
     _ALSA_NUMIDS.pop(card, None)
-    for key in [key for key in _ALSA_CTL_MAX if key[0] == card]:
-        del _ALSA_CTL_MAX[key]
+    for key in list(_ALSA_CTL_MAX):
+        if key[0] == card:
+            _ALSA_CTL_MAX.pop(key, None)
 
 
 def _alsa_get(card):
@@ -251,23 +325,35 @@ class WaveDevice:
         self._card = None
         self._last_fw = None  # last known firmware state for change detection
         self.profile = None
+        self.usbbus = None
+        self.info = {}
+        self._last_alsa_at = 0.0
 
     @property
     def connected(self):
         return self._handle is not None
 
-    def connect(self):
-        for profile in PROFILES:
-            handle = _lib.libusb_open_device_with_vid_pid(
-                _ctx, profile.vid, profile.pid
-            )
-            if not handle:
-                continue
-
-            # snd-usb-audio and OpenWave share endpoint 0. Do not start vendor
-            # transfers while ALSA is still probing the device at login.
+    def connect(self, profile=None, bus=None, addr=None):
+        """Open the exact scanned unit, only after its ALSA controls are ready."""
+        if profile is None:
+            found = scan()
+            if not found:
+                raise DeviceNotReadyError("No supported Elgato Wave device found")
+            profile, bus, addr = found[0]
+        if bus is None or addr is None:
+            raise ValueError("Opening a device requires both USB bus and address")
+        usbbus = f"{bus:03d}/{addr:03d}"
+        with self._lock:
+            if self._handle is not None:
+                raise RuntimeError("Device is already connected")
+            handle = self._open_at(profile, bus, addr)
+            if handle is None:
+                raise DeviceNotReadyError(
+                    f"Cannot open {profile.display_name} at {usbbus}"
+                )
             card = _find_card(
-                profile.card_match, vid=profile.vid, pid=profile.pid
+                profile.card_match, vid=profile.vid, pid=profile.pid,
+                usbbus=usbbus,
             )
             if card is None:
                 _lib.libusb_close(handle)
@@ -282,12 +368,24 @@ class WaveDevice:
                 raise DeviceUnresponsiveError(
                     f"{profile.display_name} control interface is not responding"
                 )
-
             self._handle = handle
             self.profile = profile
             self._card = card
-            return
-        raise DeviceNotReadyError("No supported Elgato Wave device found")
+            self.usbbus = usbbus
+
+    @staticmethod
+    def _open_at(profile, bus, addr):
+        handle = ctypes.c_void_p()
+
+        def visit(vid, pid, device_bus, device_addr, dev):
+            if handle.value or (vid, pid, device_bus, device_addr) != (
+                profile.vid, profile.pid, bus, addr
+            ):
+                return
+            _lib.libusb_open(dev, ctypes.byref(handle))
+
+        _each_usb_device(visit)
+        return handle.value
 
     def disconnect(self):
         card = self._card
@@ -297,12 +395,16 @@ class WaveDevice:
                 self._handle = None
             self._card = None
             self._last_fw = None
+            self.usbbus = None
+            self.info = {}
         _forget_alsa_card(card)
 
     def _ctrl_read(self, wValue, length):
         """USB control read — no detach needed."""
         buf = (ctypes.c_ubyte * length)()
         with self._lock:
+            if self._handle is None:
+                raise RuntimeError("Device disconnected")
             ret = _lib.libusb_control_transfer(
                 self._handle, RT_CLASS_IN, BREQUEST_READ, wValue, self.profile.windex,
                 buf, length, 1000,
@@ -312,6 +414,8 @@ class WaveDevice:
             if ret == LIBUSB_ERROR_TIMEOUT:
                 raise DeviceUnresponsiveError(error)
             raise RuntimeError(error)
+        if ret != length:
+            raise RuntimeError(f"Incomplete USB read ({ret}/{length} bytes)")
         return bytearray(buf[:ret])
 
     def _ctrl_write(self, wValue, data):
@@ -319,6 +423,8 @@ class WaveDevice:
         data = bytes(data)
         buf = (ctypes.c_ubyte * len(data))(*data)
         with self._lock:
+            if self._handle is None:
+                raise RuntimeError("Device disconnected")
             ret = _lib.libusb_control_transfer(
                 self._handle, RT_CLASS_OUT, BREQUEST_WRITE, wValue, self.profile.windex,
                 buf, len(data), 1000,
@@ -328,6 +434,8 @@ class WaveDevice:
             if ret == LIBUSB_ERROR_TIMEOUT:
                 raise DeviceUnresponsiveError(error)
             raise RuntimeError(error)
+        if ret != len(data):
+            raise RuntimeError(f"Incomplete USB write ({ret}/{len(data)} bytes)")
 
     def read_config(self):
         return self._ctrl_read(self.profile.wvalue_config, self.profile.config_len)
@@ -390,6 +498,11 @@ class WaveDevice:
         return struct.unpack_from('<H', self.read_config(), self.profile.off_monitor_mix)[0]
 
     def get_all(self):
+        """Read and synchronize one complete firmware transaction."""
+        with self._lock:
+            return self._get_all_locked()
+
+    def _get_all_locked(self):
         p = self.profile
         config = self.read_config()
         fw_gain = struct.unpack_from('<H', config, p.off_gain)[0]
@@ -400,7 +513,11 @@ class WaveDevice:
 
         # Sync firmware ↔ ALSA
         if self._card:
-            alsa = _alsa_get(self._card)
+            now = time.monotonic()
+            alsa = {}
+            if now - self._last_alsa_at >= 0.5:
+                alsa = _alsa_get(self._card)
+                self._last_alsa_at = now
             dirty = False  # whether we need to write config back
 
             if self._last_fw is not None:
@@ -523,4 +640,3 @@ class WaveDevice:
         self._write_config_value('<H', p.off_monitor_mix, value)
 
 
-WaveXLR = WaveDevice

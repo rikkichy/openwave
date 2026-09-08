@@ -44,7 +44,14 @@ import logging
 
 log = logging.getLogger("wavexlr.audio")
 
-SOURCE_MATCH = "alsa_input.usb-Elgato_Systems_Elgato_Wave_"
+# Every Wave family capture node. Two stems, not one "Elgato_" prefix,
+# because Elgato also ships capture cards with audio inputs that must not
+# be pinned; and not "Wave_" alone, because the XLR Dock (MK.2) enumerates
+# as "Elgato_XLR_Dock_..." — the old single-stem match silently skipped it.
+SOURCE_MATCHES = (
+    "alsa_input.usb-Elgato_Systems_Elgato_Wave_",
+    "alsa_input.usb-Elgato_Systems_Elgato_XLR_Dock_",
+)
 
 # Seconds without byte flow before we consider the keepalive wedged. At
 # 48 kHz mono s16 the healthy rate is ~96 kB/s, so even 1s of silence is
@@ -81,9 +88,6 @@ MAX_SILENCE_RECYCLES = 1
 # to attach, negotiate, and start emitting samples.
 STARTUP_GRACE = 1.0
 
-# Retry quickly while PipeWire is publishing the device, then back off when a
-# Wave device is genuinely absent. This keeps capture ahead of playback during
-# login without polling an unplugged setup several times per second forever.
 ABSENT_RETRY_INITIAL = 0.1
 ABSENT_RETRY_MAX = 5.0
 
@@ -95,16 +99,16 @@ SIGTERM_GRACE = 0.5
 
 
 def _pw_dump():
-    """Get PipeWire object dump as JSON."""
+    """Return the graph, or None when observation failed."""
     try:
-        r = subprocess.run(
+        result = subprocess.run(
             ["pw-dump", "--no-colors"], capture_output=True, text=True, timeout=5
         )
-        if r.returncode == 0:
-            return json.loads(r.stdout)
-    except Exception:
+        if result.returncode == 0:
+            return json.loads(result.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError):
         pass
-    return []
+    return None
 
 
 def _source_is_muted(node_name):
@@ -118,6 +122,8 @@ def _source_is_muted(node_name):
     if not node_name:
         return False
     dump = _pw_dump()
+    if dump is None:
+        return None
     device_id = None
     for obj in dump:
         if obj.get("type") != "PipeWire:Interface:Node":
@@ -142,74 +148,94 @@ def _source_is_muted(node_name):
     return False
 
 
-def _get_source_node_name():
-    """Get the full node name of the Elgato Wave source."""
-    for obj in _pw_dump():
+def _get_source_node_names():
+    """Every Elgato Wave capture node currently present, in dump order."""
+    dump = _pw_dump()
+    if dump is None:
+        return None
+    names = []
+    for obj in dump:
         if obj.get("type") != "PipeWire:Interface:Node":
             continue
         props = obj.get("info", {}).get("props", {})
         name = props.get("node.name", "")
-        if name.startswith(SOURCE_MATCH):
-            return name
-    return None
+        if name.startswith(SOURCE_MATCHES) and name not in names:
+            names.append(name)
+    return names
 
 
-class AudioManager:
-    """Keeps the Wave XLR capture stream active via a watched pw-cat subprocess.
+def _aggregate(states):
+    """One (present, healthy, state) for many pins.
 
-    The subprocess's stdout is drained by a reader thread; the main loop
-    detects wedge ("alive but no data") and recycles the subprocess.
+    The worst pin wins the state — a wedged device must not hide behind a
+    healthy one — and the manager is healthy only when every pin is.
     """
+    if not states:
+        return False, False, "absent"
+    for worst in ("wedged", "silent"):
+        if worst in states:
+            return True, False, worst
+    return True, all(s == "ok" for s in states), "ok"
 
-    def __init__(self, on_status_change=None):
-        self._running = False
-        self._loop_thread = None
-        self._cat_proc = None
-        self._reader_thread = None
+
+class _Pin:
+    """One watched pw-cat keepalive against one Wave capture node."""
+
+    def __init__(self, source_name):
+        self.source_name = source_name
+        self.state = "ok"
+        self._proc = None
+        self._reader = None
         self._last_data_at = 0.0
         self._last_signal_at = 0.0
-        self._source_name = None
+        self._started_at = 0.0
         self._silence_recycles = 0
         self._muted = False
         self._mute_checked_at = 0.0
-        self._absent_retry = ABSENT_RETRY_INITIAL
-        self._healthy = False
-        self._state = "absent"
-        self._device_present = False
-        self._status_reported = False
-        self.on_status_change = on_status_change
 
-    @property
-    def healthy(self):
-        return self._healthy
-
-    @property
-    def state(self):
-        """One of "ok", "wedged", "silent", "absent"."""
-        return self._state
-
-    @property
-    def device_present(self):
-        return self._device_present
+    # --- lifecycle ---
 
     def start(self):
-        if self._running:
-            return
-        self._running = True
-        self._loop_thread = threading.Thread(target=self._run, daemon=True)
-        self._loop_thread.start()
+        self.kill()
+        now = time.monotonic()
+        self._last_data_at = now
+        self._last_signal_at = now
+        self._started_at = now
+        self._proc = subprocess.Popen(
+            [
+                "pw-cat", "--record",
+                "--target", self.source_name,
+                "--channels", "1",
+                "--format", "s16",
+                "--rate", "48000",
+                "--latency", "200ms",
+                "--properties", json.dumps({
+                    "node.name": f"openwave_keepalive_{self.source_name}",
+                    "node.description": "OpenWave capture keepalive",
+                    "media.name": f"OpenWave keepalive: {self.source_name}",
+                    "application.name": "OpenWave",
+                }),
+                "-",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            # New process group so SIGKILL on the leader cleans up any
+            # children too. start_new_session=True is the portable spelling.
+            start_new_session=True,
+        )
+        self._reader = threading.Thread(
+            target=self._drain, args=(self._proc,), daemon=True
+        )
+        self._reader.start()
+        log.info(
+            f"Started capture keepalive for {self.source_name} "
+            f"(PID {self._proc.pid})"
+        )
 
-    def stop(self):
-        self._running = False
-        self._kill_cat()
-        if self._loop_thread:
-            self._loop_thread.join(timeout=3)
-
-    def _kill_cat(self):
-        proc = self._cat_proc
-        reader = self._reader_thread
-        self._cat_proc = None
-        self._reader_thread = None
+    def kill(self):
+        proc, reader = self._proc, self._reader
+        self._proc = None
+        self._reader = None
         if proc and proc.poll() is None:
             try:
                 proc.terminate()
@@ -225,39 +251,10 @@ class AudioManager:
                     proc.wait(timeout=1)
                 except subprocess.TimeoutExpired:
                     pass
-            log.info("Stopped capture keepalive")
+            log.info(f"Stopped capture keepalive for {self.source_name}")
         # Reader thread exits when the pipe closes.
         if reader and reader.is_alive():
             reader.join(timeout=2)
-
-    def _start_cat(self, source_name):
-        """Spawn pw-cat with stdout piped so we can monitor byte flow."""
-        self._kill_cat()
-        now = time.monotonic()
-        self._last_data_at = now
-        self._last_signal_at = now
-        self._source_name = source_name
-        self._cat_proc = subprocess.Popen(
-            [
-                "pw-cat", "--record",
-                "--target", source_name,
-                "--channels", "1",
-                "--format", "s16",
-                "--rate", "48000",
-                "--latency", "200ms",
-                "-",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            # New process group so SIGKILL on the leader cleans up any
-            # children too. start_new_session=True is the portable spelling.
-            start_new_session=True,
-        )
-        self._reader_thread = threading.Thread(
-            target=self._drain, args=(self._cat_proc,), daemon=True
-        )
-        self._reader_thread.start()
-        log.info(f"Started capture keepalive (PID {self._cat_proc.pid})")
 
     def _drain(self, proc):
         """Drain pw-cat's stdout, updating the last-data-received timestamp.
@@ -271,12 +268,11 @@ class AudioManager:
                 chunk = proc.stdout.read(DRAIN_CHUNK)
                 if not chunk:
                     return
-                now = time.monotonic()
-                self._last_data_at = now
-                # count(0) is a C-level scan; `any(chunk)` would be a
-                # Python loop over every byte of a 96 kB/s stream.
-                if chunk.count(0) != len(chunk):
-                    self._last_signal_at = now
+                if self._proc is proc:
+                    now = time.monotonic()
+                    self._last_data_at = now
+                    if chunk.count(0) != len(chunk):
+                        self._last_signal_at = now
         except Exception:
             return
         finally:
@@ -285,8 +281,10 @@ class AudioManager:
             except Exception:
                 pass
 
-    def _cat_alive(self):
-        return self._cat_proc is not None and self._cat_proc.poll() is None
+    # --- health ---
+
+    def _alive(self):
+        return self._proc is not None and self._proc.poll() is None
 
     def _data_flowing(self):
         return (time.monotonic() - self._last_data_at) < WEDGE_TIMEOUT
@@ -300,8 +298,114 @@ class AudioManager:
         if now - self._mute_checked_at < SILENCE_RECHECK:
             return self._muted
         self._mute_checked_at = now
-        self._muted = _source_is_muted(self._source_name)
+        self._muted = _source_is_muted(self.source_name)
         return self._muted
+
+    def step(self):
+        """Advance the watchdog one tick; returns the pin's state string."""
+        if not self._alive():
+            if self._proc is not None:
+                log.warning(
+                    f"Capture keepalive for {self.source_name} exited "
+                    f"unexpectedly (rc={self._proc.poll()}); restarting"
+                )
+            self.start()
+            self.state = "ok"
+            return self.state
+
+        if time.monotonic() - self._started_at < STARTUP_GRACE:
+            return self.state
+
+        if not self._data_flowing():
+            stalled_for = time.monotonic() - self._last_data_at
+            log.warning(
+                f"Capture keepalive for {self.source_name} wedged "
+                f"({stalled_for:.1f}s without data); recycling to release "
+                "the shared USB clock"
+            )
+            self.kill()
+            # Brief settle so PipeWire fully releases the device before
+            # the next tick's restart reattaches.
+            self.state = "wedged"
+            return self.state
+
+        if self._signal_flowing():
+            self._silence_recycles = 0
+            self.state = "ok"
+            return self.state
+
+        muted = self._source_muted()
+        if muted is None:
+            return self.state
+        if muted:
+            # Zeros are the correct output for a muted mic. Move the clock
+            # along so an unmute is what starts the silence window, not the
+            # mute that preceded it.
+            self._last_signal_at = time.monotonic()
+            self.state = "ok"
+            return self.state
+
+        silent_for = time.monotonic() - self._last_signal_at
+        if self._silence_recycles < MAX_SILENCE_RECYCLES:
+            self._silence_recycles += 1
+            log.warning(
+                f"Capture stream for {self.source_name} silent "
+                f"({silent_for:.0f}s of zero samples while unmuted); "
+                "recycling once"
+            )
+            self.kill()
+        self.state = "silent"
+        return self.state
+
+
+class AudioManager:
+    """One watched keepalive per connected Wave device.
+
+    Discovery reruns every tick, so a device plugged in later gets its pin
+    and an unplugged one loses it. Status is the aggregate: the worst pin's
+    state, healthy only when every pin is — two devices means two shared
+    USB clocks, either of which can wedge on its own.
+    """
+
+    def __init__(self, on_status_change=None):
+        self._running = False
+        self._loop_thread = None
+        self._pins = {}  # source node name -> _Pin
+        self._stop = threading.Event()
+        self._absent_retry = ABSENT_RETRY_INITIAL
+        self._status_reported = False
+        self._healthy = False
+        self._state = "absent"
+        self._device_present = False
+        self.on_status_change = on_status_change
+
+    @property
+    def healthy(self):
+        return self._healthy
+
+    @property
+    def state(self):
+        """One of "ok", "wedged", "silent", "absent" — the worst pin's."""
+        return self._state
+
+    @property
+    def device_present(self):
+        return self._device_present
+
+    def start(self):
+        if self._running:
+            return
+        self._running = True
+        self._stop.clear()
+        self._loop_thread = threading.Thread(target=self._run, daemon=True)
+        self._loop_thread.start()
+
+    def stop(self):
+        self._running = False
+        self._stop.set()
+        if self._loop_thread:
+            self._loop_thread.join()
+            self._loop_thread = None
 
     def _update_status(self, present, healthy, state):
         changed = (
@@ -318,77 +422,42 @@ class AudioManager:
             self.on_status_change(present, healthy, state)
 
     def _run(self):
-        while self._running:
-            try:
-                if self._cat_alive():
-                    if not self._data_flowing():
-                        stalled_for = time.monotonic() - self._last_data_at
-                        log.warning(
-                            f"Capture keepalive wedged ({stalled_for:.1f}s "
-                            "without data); recycling to release the shared "
-                            "USB clock"
+        try:
+            while not self._stop.is_set():
+                delay = WATCHDOG_INTERVAL
+                try:
+                    names = _get_source_node_names()
+                    if names is None:
+                        self._stop.wait(WATCHDOG_INTERVAL)
+                        continue
+                    if self._stop.is_set():
+                        break
+                    for name in list(self._pins):
+                        if name not in names:
+                            self._pins.pop(name).kill()
+                    for name in names:
+                        if self._stop.is_set():
+                            break
+                        if name not in self._pins:
+                            self._pins[name] = _Pin(name)
+                    states = []
+                    for pin in self._pins.values():
+                        if self._stop.is_set():
+                            break
+                        states.append(pin.step())
+                    self._update_status(*_aggregate(states))
+                    if states:
+                        self._absent_retry = ABSENT_RETRY_INITIAL
+                    else:
+                        delay = self._absent_retry
+                        self._absent_retry = min(
+                            ABSENT_RETRY_MAX, self._absent_retry * 2
                         )
-                        self._kill_cat()
-                        self._update_status(True, False, "wedged")
-                        # Brief settle so PipeWire fully releases the device
-                        # before the new pw-cat reattaches.
-                        time.sleep(0.5)
-                        continue
-
-                    if self._signal_flowing():
-                        self._silence_recycles = 0
-                        self._update_status(True, True, "ok")
-                        time.sleep(WATCHDOG_INTERVAL)
-                        continue
-
-                    if self._source_muted():
-                        # Zeros are the correct output for a muted mic.
-                        # Move the clock along so an unmute is what starts
-                        # the silence window, not the mute that preceded it.
-                        self._last_signal_at = time.monotonic()
-                        self._update_status(True, True, "ok")
-                        time.sleep(WATCHDOG_INTERVAL)
-                        continue
-
-                    silent_for = time.monotonic() - self._last_signal_at
-                    if self._silence_recycles < MAX_SILENCE_RECYCLES:
-                        self._silence_recycles += 1
-                        log.warning(
-                            f"Capture stream silent ({silent_for:.0f}s of zero "
-                            "samples while unmuted); recycling once"
-                        )
-                        self._kill_cat()
-                        self._update_status(True, False, "silent")
-                        time.sleep(0.5)
-                        continue
-
-                    self._update_status(True, False, "silent")
-                    time.sleep(SILENCE_RECHECK)
-                    continue
-
-                if self._cat_proc is not None:
-                    log.warning(
-                        f"Capture keepalive exited unexpectedly "
-                        f"(rc={self._cat_proc.poll()}); restarting"
-                    )
-                    self._cat_proc = None
-
-                source_name = _get_source_node_name()
-                if not source_name:
-                    self._update_status(False, False, "absent")
-                    time.sleep(self._absent_retry)
-                    self._absent_retry = min(
-                        ABSENT_RETRY_MAX, self._absent_retry * 2
-                    )
-                    continue
-
-                self._absent_retry = ABSENT_RETRY_INITIAL
-                self._start_cat(source_name)
-                time.sleep(STARTUP_GRACE)
-                started = self._cat_alive() and self._data_flowing()
-                self._update_status(True, started, "ok" if started else "wedged")
-
-            except Exception as e:
-                log.error(f"Audio manager error: {e}")
-                self._update_status(self._device_present, False, self._state)
-                time.sleep(2)
+                except Exception:
+                    log.exception("Audio manager error")
+                    delay = 2.0
+                self._stop.wait(delay)
+        finally:
+            for pin in self._pins.values():
+                pin.kill()
+            self._pins.clear()

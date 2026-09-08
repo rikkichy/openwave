@@ -20,6 +20,8 @@ OpenWave is an open-source, reverse-engineered alternative to Elgato Wave Link f
 
 ## Features
 
+- **Multiple devices** — Every supported unit is opened and polled independently, including two of the same model. The sidebar selects a unit by serial or USB bus/address fallback; queued controls stay bound to that unit.
+- **Hotplug** — Adding or removing a device preserves the other connected units. The capture daemon maintains one keepalive per Wave input.
 - **Microphone controls** — Adjust gain and mute, with 48 V phantom power on supported XLR devices.
 - **Headphone controls** — Set volume, enable low impedance mode on supported devices, or adjust the Wave:3 monitor mix.
 - **Hardware and system sync** — Polling at 10 Hz tracks physical buttons and knobs. Mute and headphone volume sync bidirectionally with PipeWire/ALSA.
@@ -36,6 +38,8 @@ OpenWave is an open-source, reverse-engineered alternative to Elgato Wave Link f
 | **Wave:3** | `0fd9:0070` | Gain, mute, headphone volume, monitor mix |
 
 Controls are enabled by the device profile. Phantom power and low impedance mode are available on the supported XLR models; monitor mix is available on Wave:3.
+
+The similarly named `0fd9:00c7` Dock variant is unverified and is not enabled.
 
 ## Installation
 
