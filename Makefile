@@ -40,6 +40,7 @@ install: check-version
 	install -m644 icons/*-symbolic.svg "$(DATADIR)/icons/hicolor/symbolic/apps/"
 	install -m644 icons/*.svg "$(APPDIR)/icons/"
 	install -Dm644 README.md "$(DOCDIR)/README.md"
+	install -Dm644 openwave.svg "$(DOCDIR)/openwave.svg"
 	if [ -d docs ]; then \
 		install -dm755 "$(DOCDIR)/docs"; \
 		tar --mode='u=rwX,go=rX' -C docs -cf - . | tar --no-same-owner --no-same-permissions -C "$(DOCDIR)/docs" -xf -; \
