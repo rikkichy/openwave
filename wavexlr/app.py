@@ -9,6 +9,7 @@ import logging
 import os
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from collections import Counter
 
 from .device import WaveDevice, DeviceUnresponsiveError, device_for_capture, scan
 from .audio import SOURCE_MATCHES
@@ -18,6 +19,7 @@ from .mixmatrix import MixMatrix
 from .mixdialog import MixDialog
 from .sourcedialog import AddSourceDialog
 from . import paths, setup, service, sources as sources_module, mixes as mixes_module, desktop as desktop_module
+from . import scenes as scenes_module
 
 logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s")
 KNOB_LABELS = {"gain": "Gain", "hp": "Headphones", "mix": "Monitor Mix"}
@@ -104,6 +106,12 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         service_pop.set_child(service_box)
         self.service_btn.set_popover(service_pop)
         header.pack_start(self.service_btn)
+        self.scene_btn = Gtk.MenuButton(label="Scenes")
+        header.pack_start(self.scene_btn)
+        save_scene = Gio.SimpleAction.new("save-scene-as", None)
+        save_scene.connect("activate", lambda *_: self.prompt_save_scene())
+        self.add_action(save_scene)
+        self._rebuild_scene_menu()
         refresh = Gtk.Button(icon_name="view-refresh-symbolic", tooltip_text="Reconnect")
         refresh.connect("clicked", lambda _: self._try_connect())
         header.pack_end(refresh)
@@ -473,14 +481,17 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         if not self._selector_updating and 0 <= index < len(self._devs):
             self._select_device(self._devs[index])
 
-    def _select_device(self, device):
-        # A delayed slider send belongs to the previous device, never the new
-        # selection. Already queued operations captured their device object.
+    def _cancel_device_edits(self):
         for name in ("_gain_timeout", "_hp_timeout", "_mix_timeout"):
             source_id = getattr(self, name)
             if source_id:
                 GLib.source_remove(source_id)
                 setattr(self, name, None)
+
+    def _select_device(self, device):
+        # A delayed slider send belongs to the previous device, never the new
+        # selection. Already queued operations captured their device object.
+        self._cancel_device_edits()
         self.dev = device
         self._last_state = None
         if device is self._empty_device:
@@ -1098,6 +1109,7 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         sinks, default = self.mixer.output_sinks(), self.mixer.default_sink()
         for mid in self._mixes:
             self.matrix.set_mix_outputs(mid, *self._output_entries(mid, sinks, default))
+        self._push_remote_state()
 
     def _on_mix_output_changed(self, _matrix, mix_id, output):
         self.mixer.set_output(mix_id, output)
@@ -1121,6 +1133,7 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         self._mixes = mixes_module.update(self._mixes, mix_id, name=name, icon_name=icon_name)
         self.mixer.set_mixes(self._mixes)
         self.matrix.set_mix(mix_id, title=name, icon_name=icon_name)
+        self._push_remote_state()
 
     def _cancel_cell_edits(self, source_id=None, mix_id=None):
         for key, timer in list(self._cell_debounce_ids.items()):
@@ -1146,6 +1159,7 @@ class WaveXLRWindow(Adw.ApplicationWindow):
                 and not cells.get(f"{sid}.{mid}", {}).get("muted")
                 for sid, source in self._sources.items())
             self.matrix.set_mix_empty(mid, not fed)
+        self._push_remote_state()
 
     def _refresh_device_meter(self, source_id, source):
         node = source["node_name"]
@@ -1191,6 +1205,7 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         for mid in self._mixes:
             self._wire_cell(source["id"], mid)
         self._refresh_source_meter(source["id"])
+        self._refresh_mix_emptiness()
 
     def _add_discovered_inputs(self, captures):
         waves = [item for item in captures if item["name"].startswith(SOURCE_MATCHES)]
@@ -1244,6 +1259,7 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         self.meter.stop(source_id)
         self._meter_targets.pop(source_id, None)
         self._refresh_source_meter(source_id)
+        self._refresh_mix_emptiness()
 
     def _on_move_source_clicked(self, _matrix, source_id, delta):
         if source_id not in self._sources:
@@ -1393,6 +1409,211 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         self._refresh_mix_emptiness()
         return muted
 
+    def scene_names(self):
+        return {sid: scene["name"] for sid, scene in scenes_module.load().items()}
+
+    def _hardware_scene_state(self):
+        keys = [scenes_module.hardware_key(dev.profile.key, dev.info.get("serial", ""))
+                for dev in self._devs]
+        counts = Counter(keys)
+        result = {}
+        for dev, key in zip(self._devs, keys):
+            if counts[key] != 1:
+                continue
+            keep = ["gain_raw", "mute", "hp_volume_db"]
+            if dev.profile.has_low_z:
+                keep.append("low_impedance")
+            if dev.profile.has_monitor_mix:
+                keep.append("monitor_mix")
+            state = self._device_states.get(dev, {})
+            result[key] = {field: state[field] for field in keep if field in state}
+        return result
+
+    def save_scene(self, name):
+        if not name.strip():
+            raise ValueError("A scene needs a name")
+        payload = self.mixer.scene_state()
+        payload["hardware"] = self._hardware_scene_state()
+        sid = scenes_module.put(name.strip(), payload)
+        self._rebuild_scene_menu()
+        return sid
+
+    def _scene_hardware_jobs(self, hardware):
+        profiles = Counter(dev.profile.key for dev in self._devs)
+        identities = Counter((dev.profile.key, dev.info.get("serial", ""))
+                             for dev in self._devs)
+        jobs, used = [], set()
+        for dev in self._devs:
+            serial = dev.info.get("serial", "")
+            if identities[(dev.profile.key, serial)] != 1:
+                continue
+            entry = scenes_module.pick_hardware_entry(
+                hardware, dev.profile.key, serial, profile_count=profiles[dev.profile.key])
+            if entry is None:
+                continue
+            serial_key = scenes_module.hardware_key(dev.profile.key, serial)
+            key = serial_key if serial_key in hardware else dev.profile.key
+            jobs.append((dev, entry, key))
+            used.add(key)
+        return jobs, ["hardware " + key for key in hardware if key not in used]
+
+    def apply_scene(self, sid):
+        scene = scenes_module.load().get(sid)
+        if scene is None:
+            raise KeyError("Unknown scene: " + sid)
+        self._cancel_cell_edits()
+        self._cancel_device_edits()
+        jobs, skipped = self._scene_hardware_jobs(scene.get("hardware", {}))
+        # A row's explicit mute wins. Hardware-only recalls still participate in
+        # exclusive groups rather than opening a second microphone behind them.
+        for dev, entry, _key in jobs:
+            if "mute" in entry:
+                for source_id, source in self._sources.items():
+                    if self._device_for_source(source) is dev:
+                        scene.setdefault("sources", {}).setdefault(source_id, {}).setdefault(
+                            "muted", entry["mute"])
+        try:
+            skipped += self.mixer.apply_scene(scene)
+        except OSError as error:
+            skipped.append("mix persistence")
+            self._show_error("Unable to save recalled mix levels", error)
+        levels = self.mixer.scene_state()
+        previous = self._sources
+        self._sources = {source_id: dict(source, **levels["sources"][source_id])
+                         for source_id, source in previous.items()}
+        try:
+            sources_module.save(self._sources)
+        except OSError as error:
+            skipped.append("source persistence")
+            self._show_error("Unable to save recalled source levels", error)
+        for source_id, source in self._sources.items():
+            row = self.matrix.source(source_id)
+            row.set_volume(source["level"])
+            row.set_muted(source["muted"])
+            if source["muted"] != previous[source_id]["muted"]:
+                self._sync_hw_mute(source, source["muted"])
+            for mix_id in self._mixes:
+                value = levels["cells"][f"{source_id}.{mix_id}"]
+                cell = self.matrix.cell(source_id, mix_id)
+                cell.set_volume(value["volume"])
+                cell.set_muted(value["muted"])
+        for mix_id, value in levels["volumes"].items():
+            self.matrix.set_mix_volume(mix_id, value["volume"])
+        self._apply_scene_hardware(jobs, skipped)
+        self._refresh_outputs()
+        self._refresh_mix_emptiness()
+        self._notify_tray()
+        self.scene_btn.set_tooltip_text("Skipped: " + ", ".join(skipped) if skipped else None)
+        if skipped:
+            logging.warning("Scene %s skipped: %s", sid, ", ".join(skipped))
+        return skipped
+
+    def _apply_scene_hardware(self, jobs, skipped):
+        for dev, entry, key in jobs:
+            commands = []
+            for field, method in (("gain_raw", "set_gain_raw"), ("mute", "set_mute"),
+                                  ("hp_volume_db", "set_hp_volume_db"),
+                                  ("low_impedance", "set_low_impedance"),
+                                  ("monitor_mix", "set_monitor_mix")):
+                if field not in entry:
+                    continue
+                value = entry[field]
+                if field == "gain_raw":
+                    if (self.gain_lock.get_active() and dev is self.dev) or value > dev.profile.gain_max:
+                        skipped.append(f"hardware {key}: gain locked or out of range")
+                        continue
+                if field == "low_impedance" and not dev.profile.has_low_z:
+                    skipped.append(f"hardware {key}: low impedance unsupported")
+                    continue
+                if field == "monitor_mix" and (not dev.profile.has_monitor_mix or value > dev.profile.mix_max):
+                    skipped.append(f"hardware {key}: monitor mix unsupported or out of range")
+                    continue
+                if field == "mute":
+                    bound = [source for source in self._sources.values()
+                             if self._device_for_source(source) is dev]
+                    if bound:
+                        value = all(source["muted"] for source in bound)
+                commands.append((method, value))
+            if not commands:
+                continue
+            def push(device=dev, changes=commands):
+                for method, value in changes:
+                    getattr(device, method)(value)
+                return device.get_all()
+            self._usb_async(push, lambda state, device=dev: self._on_poll_result(device, state),
+                lambda error, device=dev: self._on_device_error(device, error), device=dev)
+
+    def delete_scene(self, sid):
+        removed = scenes_module.remove(sid)
+        self._rebuild_scene_menu()
+        return removed
+
+    def _rebuild_scene_menu(self):
+        menu = Gio.Menu()
+        try:
+            names = self.scene_names()
+        except scenes_module.Unreadable as error:
+            self.scene_btn.set_tooltip_text(str(error))
+            menu.append("Scene store cannot be read", None)
+            self.scene_btn.set_menu_model(menu)
+            logging.warning("%s", error)
+            return
+        recall, delete = Gio.Menu(), Gio.Menu()
+        for sid, name in sorted(names.items(), key=lambda item: item[1].casefold()):
+            for section, action in ((recall, "app.apply-scene"), (delete, "app.delete-scene")):
+                item = Gio.MenuItem.new(name, None)
+                item.set_action_and_target_value(action, GLib.Variant("s", sid))
+                section.append_item(item)
+        if names:
+            menu.append_section(None, recall)
+        manage = Gio.Menu()
+        manage.append("Save current as…", "win.save-scene-as")
+        if names:
+            manage.append_submenu("Delete scene", delete)
+        menu.append_section(None, manage)
+        self.scene_btn.set_menu_model(menu)
+        action = self.get_application().lookup_action("scenes")
+        if action is not None:
+            action.set_state(GLib.Variant("s", json.dumps(names)))
+
+    def prompt_save_scene(self):
+        dialog = Adw.AlertDialog(heading="Save Scene",
+            body="Save trims, sends, mutes, outputs, masters and cached device levels. "
+                 "Phantom power is excluded. Saving the same name replaces it.")
+        entry = Gtk.Entry(placeholder_text="Streaming")
+        dialog.set_extra_child(entry)
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("save", "Save")
+        dialog.set_response_enabled("save", False)
+        entry.connect("changed", lambda widget: dialog.set_response_enabled(
+            "save", bool(widget.get_text().strip())))
+        dialog.set_response_appearance("save", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("save")
+        def done(alert, result):
+            if alert.choose_finish(result) == "save":
+                try:
+                    self.save_scene(entry.get_text())
+                except (OSError, ValueError, scenes_module.Unreadable) as error:
+                    self._show_error("Unable to save scene", error)
+        dialog.choose(self, None, done)
+
+    def remote_snapshot(self):
+        levels = self.mixer.scene_state()
+        return json.dumps({
+            "sources": [dict(id=sid, name=source["name"], kind=sources_module.kind(source),
+                             group=sources_module.group(source), **levels["sources"][sid])
+                        for sid, source in self._sources.items()],
+            "mixes": [dict(id=mid, name=mix["name"], sink=mix["sink"])
+                      for mid, mix in self._mixes.items()],
+            "cells": levels["cells"], "outputs": levels["outputs"],
+            "volumes": levels["volumes"], "groups": self.source_groups(),
+        }, allow_nan=False)
+
+    def _push_remote_state(self):
+        application = self.get_application()
+        if isinstance(application, WaveXLRApp):
+            application.push_states()
+
 
 class WaveXLRApp(Adw.Application):
     def __init__(self):
@@ -1403,10 +1624,65 @@ class WaveXLRApp(Adw.Application):
         self._window = None
         self._start_hidden = False
         self._tray = None
+        self._register_remote_actions()
         self.add_main_option(
             "hide", 0, GLib.OptionFlags.NONE, GLib.OptionArg.NONE,
             "Start hidden in system tray", None,
         )
+
+    def _register_remote_actions(self):
+        mutations = {
+            "switch-group": ("s", "switch_group"),
+            "set-source-level": ("(sd)", "set_source_volume"),
+            "toggle-source-mute": ("s", "toggle_source_mute"),
+            "set-cell-level": ("(ssd)", "set_cell_volume"),
+            "toggle-cell-mute": ("(ss)", "toggle_cell_mute"),
+            "apply-scene": ("s", "apply_scene"),
+            "save-scene": ("s", "save_scene"),
+            "delete-scene": ("s", "delete_scene"),
+        }
+        for name, (signature, method) in mutations.items():
+            action = Gio.SimpleAction.new(name, GLib.VariantType.new(signature))
+            action.connect("activate", self._remote_activate, method)
+            self.add_action(action)
+        self._remote_getters = {
+            "snapshot": ("s", lambda: self._window.remote_snapshot()),
+            "source-groups": ("as", lambda: self._window.source_groups()),
+            "scenes": ("s", lambda: json.dumps(self._window.scene_names())),
+            "levels": ("s", lambda: self._window.remote_levels()),
+        }
+        for name, (signature, _getter) in self._remote_getters.items():
+            action = Gio.SimpleAction.new_stateful(name, None,
+                GLib.Variant(signature, [] if signature == "as" else "{}"))
+            action.connect("activate", self._remote_read)
+            # Published telemetry is read-only; clients cannot spoof it through
+            # org.gtk.Actions.SetState.
+            action.connect("change-state", lambda *_: None)
+            self.add_action(action)
+
+    def _remote_activate(self, action, parameter, method):
+        if self._window is None or self._window._shutting_down:
+            return
+        try:
+            value = parameter.unpack()
+            args = value if isinstance(value, tuple) else (value,)
+            getattr(self._window, method)(*args)
+            self.push_states()
+        except (OSError, ValueError, KeyError, scenes_module.Unreadable) as error:
+            logging.warning("Remote %s failed: %s", action.get_name(), error)
+
+    def _remote_read(self, action, _parameter=None):
+        if self._window is None or self._window._shutting_down:
+            return
+        signature, getter = self._remote_getters[action.get_name()]
+        try:
+            action.set_state(GLib.Variant(signature, getter()))
+        except (OSError, ValueError, scenes_module.Unreadable) as error:
+            logging.warning("Remote %s failed: %s", action.get_name(), error)
+
+    def push_states(self):
+        for name in ("snapshot", "source-groups"):
+            self._remote_read(self.lookup_action(name))
 
     def do_command_line(self, command_line):
         options = command_line.get_options_dict()
@@ -1432,6 +1708,7 @@ class WaveXLRApp(Adw.Application):
                 self._show_setup_dialog()
                 return
             self._window = WaveXLRWindow(application=self)
+            self.push_states()
             # Hide-to-tray on close instead of quitting
             self._window.connect("close-request", self._on_close_request)
             self._setup_tray()

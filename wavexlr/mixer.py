@@ -325,6 +325,74 @@ class Mixer:
         with self._lock:
             return copy.deepcopy({key: value for key, value in self._state.items() if "." in key})
 
+    def scene_state(self):
+        """One cached snapshot of desired levels and observed, restored masters."""
+        with self._lock:
+            return {
+                "sources": {sid: {"level": source["level"], "muted": source["muted"]}
+                            for sid, source in self._sources.items()},
+                "cells": {f"{sid}.{mid}": dict(self._state.get(
+                    f"{sid}.{mid}", {"volume": 0.0, "muted": False}))
+                    for sid in self._sources for mid in self._mixes},
+                "outputs": {mid: self._state[OUTPUTS_STATE_KEY].get(
+                    mid, OUTPUT_AUTO if mid == "personal" else OUTPUT_NONE)
+                    for mid in self._mixes},
+                "volumes": copy.deepcopy(self._state[VOLUMES_STATE_KEY]),
+            }
+
+    def apply_scene(self, scene):
+        """Publish one level-only desired state; never create source/mix identities."""
+        from . import scenes
+        if not isinstance(scene, dict):
+            raise ValueError("Scene must be an object")
+        scenes.validate({"recall": dict(scene, name=scene.get("name", ""))})
+        skipped = []
+        with self._lock:
+            records, state = copy.deepcopy((self._sources, self._state))
+            for sid, entry in scene.get("sources", {}).items():
+                if sid not in records:
+                    skipped.append("source " + sid)
+                    continue
+                group = sources.group(records[sid])
+                if entry.get("muted") is False and group:
+                    for other_id, other in records.items():
+                        if other_id != sid and sources.group(other) == group:
+                            other["muted"] = True
+                records[sid].update(entry)
+            for sid, entry in scene.get("sources", {}).items():
+                if sid in records and entry.get("muted") is False and records[sid]["muted"]:
+                    skipped.append(f"source {sid}: another group member is live")
+            for key, entry in scene.get("cells", {}).items():
+                sid, _, mid = key.rpartition(".")
+                if sid not in records or mid not in self._mixes:
+                    skipped.append("cell " + key)
+                    continue
+                state[key] = {**state.get(key, {"volume": 0.0, "muted": False}), **entry}
+            for mid, output in scene.get("outputs", {}).items():
+                if mid not in self._mixes or (output and output.startswith("openwave_")):
+                    skipped.append("output " + mid)
+                    continue
+                state[OUTPUTS_STATE_KEY][mid] = output or OUTPUT_AUTO
+            restored_mixes = []
+            for mid, entry in scene.get("volumes", {}).items():
+                if mid not in self._mixes:
+                    skipped.append("volume " + mid)
+                    continue
+                state[VOLUMES_STATE_KEY][mid] = {
+                    **state[VOLUMES_STATE_KEY].get(mid, {"volume": 1.0, "muted": False}),
+                    **entry,
+                }
+                restored_mixes.append(mid)
+            self._sources = records
+            self._state = state
+            for mid in restored_mixes:
+                self._master_revisions[mid] = self._master_revisions.get(mid, 0) + 1
+        try:
+            self._persist()
+        finally:
+            self._wake.set()
+        return skipped
+
     def streams(self):
         with self._lock:
             return copy.deepcopy(self._graph["streams"] if self._graph else {})
