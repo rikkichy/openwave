@@ -38,6 +38,6 @@ jobs:
       - name: Stage complete package
         run: make install DESTDIR="$RUNNER_TEMP/openwave-stage" PREFIX=/usr PYTHON=/usr/bin/python3
       - name: Exercise installed entry points and GTK imports
-        run: dbus-run-session -- xvfb-run -a sh packaging/smoke-install.sh "$RUNNER_TEMP/openwave-stage/usr"
+        run: PYTHON=/usr/bin/python3 dbus-run-session -- xvfb-run -a sh packaging/smoke-install.sh "$RUNNER_TEMP/openwave-stage/usr"
       - name: Validate desktop entry
         run: desktop-file-validate "$RUNNER_TEMP/openwave-stage/usr/share/applications/openwave.desktop"
