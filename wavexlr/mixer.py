@@ -485,13 +485,14 @@ class Mixer:
         for key in list(self._procs):
             if key not in desired:
                 self._drop_route(key)
-        self._restore_streams(graph, wanted_moves)
+        wanted_sinks.update(self._restore_streams(graph, wanted_moves))
         for name, handle in list(self._owned_sinks.items()):
             if name not in wanted_sinks and self._pw.destroy_sink(handle, graph):
                 del self._owned_sinks[name]
 
     def _restore_streams(self, graph, wanted):
         streams = {stream["serial"]: stream for stream in graph["streams"].values()}
+        retained = set()
         for serial, original in list(self._moved.items()):
             if serial in wanted:
                 continue
@@ -502,15 +503,21 @@ class Mixer:
             target = original if original in graph["sinks"] else graph["default"]
             if target in graph["sinks"] and not target.startswith("openwave_src_") and self._pw.move_stream(stream, target):
                 del self._moved[serial]
+            else:
+                retained.add(stream["sink"])
+        return retained
 
     def _teardown(self):
         for key in list(self._procs):
             self._drop_route(key)
         try:
-            graph = self._pw.snapshot()
-            self._restore_streams(graph, {})
+            for _ in range(3):
+                graph = self._pw.snapshot()
+                retained = self._restore_streams(graph, {})
+                if not retained:
+                    break
             for name, handle in list(self._owned_sinks.items()):
-                if self._pw.destroy_sink(handle, graph):
+                if name not in retained and self._pw.destroy_sink(handle, graph):
                     del self._owned_sinks[name]
         except GraphError as exc:
             # No current ownership evidence means no deletion, especially after

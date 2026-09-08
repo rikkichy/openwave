@@ -170,3 +170,62 @@ class RoutingTests(unittest.TestCase):
             self.assertFalse(pw.link(1, 2))
             self.assertFalse(pw.move_stream({"pulse_id": 4}, "sink"))
             self.assertFalse(pw.set_level(4, 0.2, False))
+
+    @staticmethod
+    def reconcile(mixer, pw):
+        graph = pw.snapshot()
+        mixer._discover(graph)
+        mixer._reconcile(graph)
+
+    def test_failed_restore_retains_intake_until_original_destination_recovers(self):
+        pw = PipeWire()
+        pw.sink("speakers")
+        stream = pw.stream()
+        pw.graph["streams"][stream]["sink"] = "speakers"
+        with tempfile.TemporaryDirectory() as directory:
+            mixer = Mixer(pw, config_path=str(Path(directory) / "mixes.json"))
+            try:
+                mixer.set_sources({"music": {"name": "Music", "match_app_names": ["Music"]}})
+                for _ in range(3):
+                    self.reconcile(mixer, pw)
+                self.assertEqual(pw.graph["streams"][stream]["sink"], "openwave_src_music")
+
+                mixer.remove_source("music")
+                pw.fail_moves = 1
+                self.reconcile(mixer, pw)
+                self.assertEqual(pw.graph["streams"][stream]["sink"], "openwave_src_music")
+                self.assertIn("openwave_src_music", pw.graph["sinks"])
+
+                self.reconcile(mixer, pw)
+                self.assertEqual(pw.graph["streams"][stream]["sink"], "speakers")
+                self.assertNotIn("openwave_src_music", pw.graph["sinks"])
+            finally:
+                mixer._teardown()
+                mixer.stop()
+
+    def test_teardown_retries_restore_and_retains_unresolved_intake(self):
+        for persistent_failure in (False, True):
+            with self.subTest(persistent_failure=persistent_failure), tempfile.TemporaryDirectory() as directory:
+                pw = PipeWire()
+                pw.sink("speakers")
+                stream = pw.stream()
+                pw.graph["streams"][stream]["sink"] = "speakers"
+                mixer = Mixer(pw, config_path=str(Path(directory) / "mixes.json"))
+                try:
+                    mixer.set_sources({"music": {"name": "Music", "match_app_names": ["Music"]}})
+                    for _ in range(3):
+                        self.reconcile(mixer, pw)
+                    self.assertEqual(pw.graph["streams"][stream]["sink"], "openwave_src_music")
+
+                    pw.fail_moves = 100 if persistent_failure else 1
+                    mixer._teardown()
+                    if persistent_failure:
+                        self.assertEqual(pw.graph["streams"][stream]["sink"], "openwave_src_music")
+                        self.assertIn("openwave_src_music", pw.graph["sinks"])
+                    else:
+                        self.assertEqual(pw.graph["streams"][stream]["sink"], "speakers")
+                        self.assertNotIn("openwave_src_music", pw.graph["sinks"])
+                finally:
+                    pw.fail_moves = 0
+                    mixer._teardown()
+                    mixer.stop()
