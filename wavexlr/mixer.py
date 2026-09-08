@@ -427,7 +427,10 @@ class Mixer:
 
     def set_capture_mute(self, node_name, muted):
         with self._lock:
-            self._capture_requests[node_name] = bool(muted)
+            binding = self._capture_binding(node_name)
+            if binding is None:
+                return
+            self._capture_requests[node_name] = (binding, bool(muted))
         self._wake.set()
 
     def capture_device_present(self, node_name):
@@ -517,6 +520,7 @@ class Mixer:
         normalized = sources.normalize(records)
         with self._lock:
             self._sources = normalized
+            self._prune_capture_requests()
         self._wake.set()
 
     def set_source_level(self, source_id, volume, muted):
@@ -531,6 +535,7 @@ class Mixer:
             if sources.is_protected(self._sources.get(source_id, {})):
                 raise ValueError("Protected source cannot be removed")
             self._sources.pop(source_id, None)
+            self._prune_capture_requests()
             self._state = {key: value for key, value in self._state.items() if not key.startswith(source_id + ".")}
         self._persist()
         self._wake.set()
@@ -726,20 +731,40 @@ class Mixer:
                 node = graph["nodes"].get(mix["sink"])
                 if node and self._pw.set_level(node["id"], desired["volume"], desired["muted"]):
                     self._master_pending[mid] = (identity, desired)
+                    restored = self._master_restored.get(mid)
+                    if restored is not None and restored[0] == sink["identity"]:
+                        # A level edit does not replace an already-restored sink.
+                        # Keep its routes live while the new value is confirmed.
+                        ready.add(mid)
         with self._lock:
             self._restored_snapshot = frozenset(ready)
         if changed:
             self._persist()
         return ready
 
+    def _capture_binding(self, name):
+        owners = frozenset(sid for sid, source in self._sources.items()
+                           if sources.kind(source) == sources.KIND_DEVICE and source.get("node_name") == name)
+        return owners or None
+
+    def _prune_capture_requests(self):
+        for name, (binding, _) in list(self._capture_requests.items()):
+            if self._capture_binding(name) != binding:
+                del self._capture_requests[name]
+
     def _sync_capture_mutes(self, graph):
         with self._lock:
+            self._prune_capture_requests()
             pending = dict(self._capture_requests)
         live = {item["name"] for item in graph["captures"]}
-        for name, muted in pending.items():
+        for name, request in pending.items():
+            binding, muted = request
+            with self._lock:
+                if self._capture_requests.get(name) != request or self._capture_binding(name) != binding:
+                    continue
             if name in live and self._pw.set_capture_mute(name, muted):
                 with self._lock:
-                    if self._capture_requests.get(name) == muted:
+                    if self._capture_requests.get(name) == request:
                         del self._capture_requests[name]
 
     def _reconcile(self, graph):
@@ -819,7 +844,7 @@ class Mixer:
         for key in list(self._procs):
             if key not in desired:
                 self._drop_route(key)
-        self._restore_streams(graph, wanted_moves)
+        wanted_sinks.update(self._restore_streams(graph, wanted_moves))
         with self._lock:
             removed = set(self._removed_sinks)
         for name in removed:
@@ -835,6 +860,7 @@ class Mixer:
 
     def _restore_streams(self, graph, wanted):
         streams = {stream["serial"]: stream for stream in graph["streams"].values()}
+        retained = set()
         for serial, original in list(self._moved.items()):
             if serial in wanted:
                 continue
@@ -845,15 +871,21 @@ class Mixer:
             target = original if original in graph["sinks"] else graph["default"]
             if target in graph["sinks"] and not target.startswith("openwave_src_") and self._pw.move_stream(stream, target):
                 del self._moved[serial]
+            else:
+                retained.add(stream["sink"])
+        return retained
 
     def _teardown(self):
         for key in list(self._procs):
             self._drop_route(key)
         try:
-            graph = self._pw.snapshot()
-            self._restore_streams(graph, {})
+            for _ in range(3):
+                graph = self._pw.snapshot()
+                retained = self._restore_streams(graph, {})
+                if not retained:
+                    break
             for name, handle in list(self._owned_sinks.items()):
-                if self._pw.destroy_sink(handle, graph):
+                if name not in retained and self._pw.destroy_sink(handle, graph):
                     del self._owned_sinks[name]
         except GraphError as exc:
             # No current ownership evidence means no deletion, especially after
