@@ -72,6 +72,7 @@ def normalize(records):
     if not isinstance(records, dict):
         raise ValueError("Sources must be an object")
     result = {}
+    live_groups = set()
     for sid, original in records.items():
         safe_id(sid)
         if not isinstance(original, dict) or original.get("id", sid) != sid:
@@ -91,6 +92,12 @@ def normalize(records):
         for field in ("name", "icon_name", "group", "node_name"):
             if not isinstance(source[field], str):
                 raise ValueError(f"Source {field} must be a string")
+        source["group"] = group(source)
+        if source["group"] and not source["muted"]:
+            if source["group"] in live_groups:
+                source["muted"] = True
+            else:
+                live_groups.add(source["group"])
         result[sid] = source
     return result
 

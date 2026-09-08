@@ -1,6 +1,10 @@
 """StatusNotifierItem tray icon via D-Bus (no GTK3 dependency)."""
 
+import logging
+
 from gi.repository import Gio, GLib
+
+from . import icons
 
 ITEM_XML = """
 <node>
@@ -25,6 +29,11 @@ ITEM_XML = """
       <arg name="x" type="i" direction="in"/>
       <arg name="y" type="i" direction="in"/>
     </method>
+    <signal name="NewIcon"/>
+    <signal name="NewToolTip"/>
+    <signal name="NewStatus">
+      <arg name="status" type="s" direction="out"/>
+    </signal>
   </interface>
 </node>
 """
@@ -85,81 +94,217 @@ MENU_XML = """
 """
 
 
-class TrayIcon:
-    """Minimal StatusNotifierItem tray icon."""
+# Packaged icons resolve to stock themed icons when running from a checkout.
+ICON_LIVE = "openwave-symbolic"
+ICON_MUTED = "openwave-muted-symbolic"
+ICON_ABSENT = "openwave-attention-symbolic"
 
-    def __init__(self, on_activate=None, on_mute=None, on_quit=None):
+
+def compute(connected, hardware_muted, row_muted, display_name=None):
+    """Return tray state; either hardware or matrix mute means not captured."""
+    if not connected:
+        return {
+            "icon": ICON_ABSENT,
+            "status": "Active",
+            "tooltip": "No device connected",
+            "mute_label": "Mute Mic",
+            "mute_enabled": False,
+            "muted": False,
+        }
+
+    muted = bool(hardware_muted or row_muted)
+    if muted:
+        if hardware_muted and row_muted:
+            detail = "Muted (hardware and matrix)"
+        elif hardware_muted:
+            detail = "Muted (hardware)"
+        else:
+            detail = "Muted (matrix row)"
+    else:
+        detail = "Live"
+
+    return {
+        "icon": ICON_MUTED if muted else ICON_LIVE,
+        "status": "Active",
+        "tooltip": f"{display_name}: {detail}" if display_name else detail,
+        "mute_label": "Unmute Mic" if muted else "Mute Mic",
+        "mute_enabled": True,
+        "muted": muted,
+    }
+
+
+class TrayIcon:
+    """StatusNotifierItem with no-argument activate/open/mute/quit callbacks.
+
+    register() returns False if no host can display it. unregister() releases
+    both exported objects; call it on application shutdown. set_state accepts
+    the selected device's optional display_name for its tooltip.
+    """
+
+    def __init__(self, on_activate=None, on_mute=None, on_quit=None,
+                 on_open=None):
         self._on_activate = on_activate
+        # Separate from on_activate: clicking the icon may toggle, but the
+        # menu item reads "Open OpenWave" and must open. It is also the only
+        # way back to a window that was started hidden.
+        self._on_open = on_open or on_activate
         self._on_mute = on_mute
         self._on_quit = on_quit
         self._bus = None
         self._item_reg_id = None
         self._menu_reg_id = None
-        self._name_id = None
         self._revision = 1
         self._menu_items = {}  # id -> properties dict
+        # Nothing is known before the first poll, and "no device" is the
+        # honest reading of that -- not "live", which would be a guess in the
+        # one direction this icon must never guess.
+        self._state = compute(False, False, False)
+
+    @staticmethod
+    def host_available(bus=None):
+        """True when something on this session bus will actually draw us.
+
+        Asked before anything is allowed to depend on the tray existing.
+        GNOME ships no StatusNotifier host of its own -- the watcher name
+        appears only when an AppIndicator extension is installed -- so on a
+        stock GNOME desktop a tray icon is registered successfully and drawn
+        nowhere, which is indistinguishable from working right up until the
+        window is hidden into it.
+        """
+        try:
+            bus = bus or Gio.bus_get_sync(Gio.BusType.SESSION, None)
+            reply = bus.call_sync(
+                "org.freedesktop.DBus", "/org/freedesktop/DBus",
+                "org.freedesktop.DBus", "NameHasOwner",
+                GLib.Variant("(s)", ("org.kde.StatusNotifierWatcher",)),
+                GLib.VariantType.new("(b)"), Gio.DBusCallFlags.NONE, 2000,
+                None,
+            )
+            if not reply.unpack()[0]:
+                return False
+            reply = bus.call_sync(
+                "org.kde.StatusNotifierWatcher", "/StatusNotifierWatcher",
+                "org.freedesktop.DBus.Properties", "Get",
+                GLib.Variant("(ss)", (
+                    "org.kde.StatusNotifierWatcher",
+                    "IsStatusNotifierHostRegistered")),
+                GLib.VariantType.new("(v)"), Gio.DBusCallFlags.NONE, 2000,
+                None,
+            )
+        except GLib.Error:
+            return False
+        return bool(reply.unpack()[0])
 
     def register(self):
-        self._bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        """Publish the tray item only when a host is registered to draw it."""
+        self.unregister()
+        try:
+            bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+            if not self.host_available(bus):
+                return False
+            self._bus = bus
+            self._build_menu_items()
+            menu_info = Gio.DBusNodeInfo.new_for_xml(MENU_XML)
+            self._menu_reg_id = bus.register_object(
+                "/MenuBar", menu_info.interfaces[0],
+                self._on_menu_call, self._on_menu_get_property, None)
+            item_info = Gio.DBusNodeInfo.new_for_xml(ITEM_XML)
+            self._item_reg_id = bus.register_object(
+                "/StatusNotifierItem", item_info.interfaces[0],
+                self._on_item_call, self._on_item_get_property, None)
+            bus.call_sync(
+                "org.kde.StatusNotifierWatcher", "/StatusNotifierWatcher",
+                "org.kde.StatusNotifierWatcher", "RegisterStatusNotifierItem",
+                GLib.Variant("(s)", (bus.get_unique_name(),)),
+                None, Gio.DBusCallFlags.NONE, 2000, None)
+            return True
+        except GLib.Error:
+            self.unregister()
+            return False
+
+    def unregister(self):
+        """Release exports, including partially completed registration."""
+        bus, self._bus = self._bus, None
+        for attr in ("_item_reg_id", "_menu_reg_id"):
+            registration = getattr(self, attr)
+            setattr(self, attr, None)
+            if bus is not None and registration is not None:
+                bus.unregister_object(registration)
+
+    @staticmethod
+    def _invoke(callback):
+        if callback is not None:
+            callback()
+        return False
+
+    def set_state(self, connected, hardware_muted=False, row_muted=False,
+                  display_name=None):
+        """Show what the microphone is actually doing. Returns True if it moved.
+
+        Announced only on a real change: the poll behind this runs at 10 Hz,
+        and a host redraws on every NewIcon it is handed.
+        """
+        new = compute(connected, hardware_muted, row_muted, display_name)
+        if new == self._state:
+            return False
+
+        icon_changed = new["icon"] != self._state["icon"]
+        tooltip_changed = new["tooltip"] != self._state["tooltip"]
+        menu_changed = (
+            new["mute_label"] != self._state["mute_label"]
+            or new["mute_enabled"] != self._state["mute_enabled"]
+        )
+        self._state = new
         self._build_menu_items()
 
-        # Register the menu object
-        menu_info = Gio.DBusNodeInfo.new_for_xml(MENU_XML)
-        self._menu_reg_id = self._bus.register_object(
-            "/MenuBar",
-            menu_info.interfaces[0],
-            self._on_menu_call,
-            self._on_menu_get_property,
-            None,
-        )
+        if self._bus is None:
+            return True  # not registered yet; the values are already right
+        if icon_changed:
+            self._emit_item("NewIcon", None)
+        if tooltip_changed:
+            self._emit_item("NewToolTip", None)
+        if menu_changed:
+            self._emit_menu_properties(2)
+        return True
 
-        # Register the SNI object
-        item_info = Gio.DBusNodeInfo.new_for_xml(ITEM_XML)
-        self._item_reg_id = self._bus.register_object(
-            "/StatusNotifierItem",
-            item_info.interfaces[0],
-            self._on_item_call,
-            self._on_item_get_property,
-            None,
-        )
-
-        # Own a unique bus name for the item
-        self._name_id = Gio.bus_own_name_on_connection(
-            self._bus,
-            "org.kde.StatusNotifierItem-openwave",
-            Gio.BusNameOwnerFlags.NONE,
-            None, None,
-        )
-
-        # Register with the StatusNotifierWatcher
+    def _emit_item(self, name, params):
+        """A host that has gone away must not take the application with it."""
         try:
-            self._bus.call_sync(
-                "org.kde.StatusNotifierWatcher",
-                "/StatusNotifierWatcher",
-                "org.kde.StatusNotifierWatcher",
-                "RegisterStatusNotifierItem",
-                GLib.Variant("(s)", ("org.kde.StatusNotifierItem-openwave",)),
-                None,
-                Gio.DBusCallFlags.NONE,
-                -1, None,
-            )
-        except Exception:
-            pass  # no watcher running — tray won't show but app still works
+            self._bus.emit_signal(
+                None, "/StatusNotifierItem", "org.kde.StatusNotifierItem",
+                name, params)
+        except GLib.Error as e:
+            logging.debug("tray: could not emit %s: %s", name, e)
+
+    def _emit_menu_properties(self, item_id):
+        props = self._menu_items.get(item_id, {})
+        try:
+            self._bus.emit_signal(
+                None, "/MenuBar", "com.canonical.dbusmenu",
+                "ItemsPropertiesUpdated",
+                GLib.Variant("(a(ia{sv})a(ias))", ([(item_id, props)], [])))
+        except GLib.Error as e:
+            logging.debug("tray: could not emit ItemsPropertiesUpdated: %s", e)
 
     def _on_item_call(self, conn, sender, path, iface, method, params, invocation):
-        if method == "Activate":
-            if self._on_activate:
-                self._on_activate()
         invocation.return_value(None)
+        if method == "Activate":
+            GLib.idle_add(self._invoke, self._on_activate)
+        elif method == "SecondaryActivate":
+            GLib.idle_add(self._invoke, self._on_mute)
+        elif method == "ContextMenu":
+            GLib.idle_add(self._invoke, self._on_open)
 
     def _on_item_get_property(self, conn, sender, path, iface, prop):
         props = {
             "Category": GLib.Variant("s", "Hardware"),
             "Id": GLib.Variant("s", "openwave"),
             "Title": GLib.Variant("s", "OpenWave"),
-            "Status": GLib.Variant("s", "Active"),
-            "IconName": GLib.Variant("s", "audio-input-microphone-symbolic"),
-            "ToolTip": GLib.Variant("(sa(iiay)ss)", ("", [], "OpenWave", "Elgato Wave Control")),
+            "Status": GLib.Variant("s", self._state["status"]),
+            "IconName": GLib.Variant("s", icons.resolve(self._state["icon"])),
+            "ToolTip": GLib.Variant(
+                "(sa(iiay)ss)",
+                ("", [], "OpenWave", self._state["tooltip"])),
             "Menu": GLib.Variant("o", "/MenuBar"),
             "ItemIsMenu": GLib.Variant("b", False),
         }
@@ -173,13 +318,13 @@ class TrayIcon:
                 "label": GLib.Variant("s", "Open OpenWave"),
                 "visible": GLib.Variant("b", True),
                 "enabled": GLib.Variant("b", True),
-                "icon-name": GLib.Variant("s", "audio-input-microphone-symbolic"),
+                "icon-name": GLib.Variant("s", icons.resolve(ICON_LIVE)),
             },
             2: {
-                "label": GLib.Variant("s", "Mute Mic"),
+                "label": GLib.Variant("s", self._state["mute_label"]),
                 "visible": GLib.Variant("b", True),
-                "enabled": GLib.Variant("b", True),
-                "icon-name": GLib.Variant("s", "microphone-sensitivity-muted-symbolic"),
+                "enabled": GLib.Variant("b", self._state["mute_enabled"]),
+                "icon-name": GLib.Variant("s", icons.resolve(ICON_MUTED)),
             },
             3: {
                 "type": GLib.Variant("s", "separator"),
@@ -231,14 +376,13 @@ class TrayIcon:
         elif method == "Event":
             item_id = params[0]
             event_id = params[1]
-            if event_id == "clicked":
-                if item_id == 1 and self._on_activate:
-                    self._on_activate()
-                elif item_id == 2 and self._on_mute:
-                    self._on_mute()
-                elif item_id == 4 and self._on_quit:
-                    self._on_quit()
             invocation.return_value(None)
+            if event_id == "clicked":
+                callback = {1: self._on_open, 4: self._on_quit}.get(item_id)
+                if item_id == 2 and self._state["mute_enabled"]:
+                    callback = self._on_mute
+                if callback is not None:
+                    GLib.idle_add(self._invoke, callback)
 
         elif method == "AboutToShow":
             invocation.return_value(GLib.Variant("(b)", (False,)))
