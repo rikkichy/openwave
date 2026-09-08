@@ -15,6 +15,7 @@ import threading
 from .device import WaveDevice, DeviceUnresponsiveError, device_for_capture, scan
 from .audio import SOURCE_MATCHES
 from .meter import MeterMonitor
+from .health import HealthMonitor
 from .mixer import Mixer, claim_streams, stream_matches, source_sink_name, OUTPUT_AUTO, OUTPUT_NONE
 from .mixmatrix import MixMatrix
 from .mixdialog import MixDialog
@@ -75,6 +76,7 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         self._mixes = mixes_module.load_seeded()
         self._offered_nodes = set(self._load_ui_state().get("offered_capture_nodes", []))
         self.meter = MeterMonitor()
+        self.health = HealthMonitor(capture_gaps=self.meter.capture_gaps)
         self._meter_targets = {}
         self.mixer = Mixer(capture_ready=lambda capture: self.meter.ready(
             capture["name"], capture["identity"]))
@@ -88,6 +90,7 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         self._update_service_status()
         self._start_meters()
         self.mixer.start()
+        self.health.start()
         self._start_stream_poll()
         self._try_connect()
         self._schedule_reconnect()
@@ -603,6 +606,7 @@ class WaveXLRWindow(Adw.ApplicationWindow):
     def shutdown(self):
         """Quiesce every device worker before closing its libusb handle."""
         self._shutting_down = True
+        self.health.stop()
         self._cancel_calibration()
         self._calibration_executor.shutdown(wait=False, cancel_futures=True)
         for source_id in list(self._fx_debounce_ids):
