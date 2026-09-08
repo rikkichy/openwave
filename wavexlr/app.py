@@ -10,6 +10,7 @@ import os
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from collections import Counter
+import threading
 
 from .device import WaveDevice, DeviceUnresponsiveError, device_for_capture, scan
 from .audio import SOURCE_MATCHES
@@ -20,6 +21,7 @@ from .mixdialog import MixDialog
 from .sourcedialog import AddSourceDialog
 from . import paths, setup, service, sources as sources_module, mixes as mixes_module, desktop as desktop_module
 from . import scenes as scenes_module
+from . import effects, calibrate
 
 logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s")
 KNOB_LABELS = {"gain": "Gain", "hp": "Headphones", "mix": "Monitor Mix"}
@@ -62,6 +64,10 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         self._updating_ui = False
         self._last_state = None
         self._cell_debounce_ids = {}
+        self._fx_debounce_ids = {}
+        self._calibration = None
+        self._calibration_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="openwave-calibration")
         self._remote_levels = {}
         self._capture_mute_seen = {}
         self._service_problem = False
@@ -597,6 +603,10 @@ class WaveXLRWindow(Adw.ApplicationWindow):
     def shutdown(self):
         """Quiesce every device worker before closing its libusb handle."""
         self._shutting_down = True
+        self._cancel_calibration()
+        self._calibration_executor.shutdown(wait=False, cancel_futures=True)
+        for source_id in list(self._fx_debounce_ids):
+            self._cancel_fx_edit(source_id)
         for name in (
             "_reconnect_id", "_poll_id", "_stream_poll_id",
             "_gain_timeout", "_hp_timeout", "_mix_timeout",
@@ -830,6 +840,9 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         if source.get("protected") and self.mixer.capture_device_present(source["node_name"]):
             return
         self._cancel_cell_edits(source_id=source_id)
+        self._cancel_fx_edit(source_id)
+        if self._calibration is not None and self._calibration["source_id"] == source_id:
+            self._cancel_calibration()
         candidate = {sid: record for sid, record in self._sources.items() if sid != source_id}
         sources_module.save(candidate)
         self._sources = candidate
@@ -1185,7 +1198,7 @@ class WaveXLRWindow(Adw.ApplicationWindow):
     def _add_source_widget(self, source):
         sid = source["id"]
         self.matrix.add_source(sid, name=source["name"], icon_name=source["icon_name"],
-            has_level=True, removable=not source.get("protected"), editable=True,
+            has_level=True, removable=True, editable=True,
             reorderable=True, is_capture=sources_module.kind(source) == sources_module.KIND_DEVICE)
         self._wire_source_row(sid)
 
@@ -1197,6 +1210,12 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         self.matrix.set_source_group(source_id, sources_module.group(source))
         row.connect("volume-changed", self._on_source_level_changed, source_id)
         row.connect("mute-toggled", self._on_source_mute_toggled, source_id)
+        if source.get("protected"):
+            row.set_removable(False)
+        if sources_module.kind(source) == sources_module.KIND_DEVICE:
+            row.set_fx(effects.fx(source))
+            row.connect("fx-changed", self._on_source_fx_changed, source_id)
+            row.connect("fx-autotune", self._on_fx_autotune, source_id)
 
     def _install_source(self, source):
         self._sources = sources_module.add(self._sources, source)
@@ -1409,6 +1428,181 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         self._refresh_mix_emptiness()
         return muted
 
+    def _cancel_fx_edit(self, source_id):
+        timer = self._fx_debounce_ids.pop(source_id, None)
+        if timer is not None:
+            GLib.source_remove(timer)
+
+    def _set_source_fx(self, source_id, settings):
+        source = self._sources.get(source_id)
+        if source is None or sources_module.kind(source) != sources_module.KIND_DEVICE:
+            raise ValueError("Effects require a capture source")
+        settings = effects.fx({"fx": settings})
+        self._cancel_fx_edit(source_id)
+        self._sources = sources_module.update(self._sources, source_id, fx=settings)
+        self.matrix.source(source_id).set_fx(settings)
+        self.mixer.set_sources(self._sources)
+        self._push_remote_state()
+
+    def _on_source_fx_changed(self, row, source_id):
+        self._cancel_fx_edit(source_id)
+        settings = row.fx_settings()
+        def apply():
+            self._fx_debounce_ids.pop(source_id, None)
+            if source_id in self._sources and not self._shutting_down:
+                try:
+                    self._set_source_fx(source_id, settings)
+                except (OSError, ValueError) as error:
+                    self.matrix.source(source_id).set_fx(effects.fx(self._sources[source_id]))
+                    self._show_error("Unable to save effects", error)
+            return False
+        self._fx_debounce_ids[source_id] = GLib.timeout_add(400, apply)
+
+    def toggle_fx(self, source_id, effect):
+        source = self._sources.get(source_id)
+        if source is None or sources_module.kind(source) != sources_module.KIND_DEVICE:
+            raise ValueError("Effects require a capture source")
+        settings = effects.fx(source)
+        if effect == "lowcut":
+            settings[effect] = 0 if settings[effect] else 80
+        elif effect in ("gate", "comp", "mono"):
+            settings[effect] = not settings[effect]
+        else:
+            raise ValueError("Only lowcut, gate, comp and mono are toggles")
+        self._set_source_fx(source_id, settings)
+        return settings[effect]
+
+    def _cancel_calibration(self):
+        session = self._calibration
+        if session is not None:
+            self._calibration = None
+            session["cancel"].set()
+            if session["dialog"] is not None:
+                session["dialog"].close()
+
+    def _on_fx_autotune(self, _row, source_id):
+        if self._calibration is not None:
+            return
+        source = self._sources.get(source_id)
+        capture = next((item for item in self.mixer.capture_sources()
+                        if source is not None and item["name"] == source.get("node_name")), None)
+        if capture is None:
+            self._show_error("Calibration unavailable", "Connect the capture device first.")
+            return
+        session = {"source_id": source_id, "node_name": capture["name"],
+                   "identity": capture["identity"], "channels": source.get("channels", 2),
+                   "cancel": threading.Event(), "dialog": None, "floor": None}
+        self._calibration = session
+        self._calibration_prompt(session, speech=False)
+
+    def _calibration_prompt(self, session, *, speech):
+        dialog = Adw.AlertDialog(
+            heading="Measure speech" if speech else "Measure room noise",
+            body=("Speak normally for five seconds after pressing Record."
+                  if speech else "Stay quiet for three seconds after pressing Record. "
+                  "Only the raw microphone is measured. Current effects and hardware gain "
+                  "stay unchanged; proposed settings require explicit confirmation."))
+        session["dialog"] = dialog
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("record", "Record")
+        dialog.set_response_appearance("record", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("record")
+        def response(alert, result):
+            answer = alert.choose_finish(result)
+            if self._calibration is not session or session["dialog"] is not alert:
+                return
+            if answer == "record":
+                self._measure_calibration(session, speech=speech)
+            else:
+                self._cancel_calibration()
+        dialog.choose(self, None, response)
+
+    def _measure_calibration(self, session, *, speech):
+        dialog = Adw.AlertDialog(
+            heading="Recording speech" if speech else "Recording room noise",
+            body="Speak normally." if speech else "Please stay quiet.")
+        spinner = Gtk.Spinner(spinning=True)
+        dialog.set_extra_child(spinner)
+        session["dialog"] = dialog
+        dialog.add_response("cancel", "Cancel")
+        def cancelled(alert, result):
+            alert.choose_finish(result)
+            if self._calibration is session and session["dialog"] is alert:
+                self._cancel_calibration()
+        dialog.choose(self, None, cancelled)
+        def measure():
+            raw = calibrate.capture_raw(session["node_name"],
+                calibrate.SPEECH_SECONDS if speech else calibrate.FLOOR_SECONDS,
+                session["channels"], cancel=session["cancel"].is_set)
+            metrics = calibrate.metrics_from_raw(raw, session["channels"])
+            if not speech:
+                return metrics
+            proposal = calibrate.analyze(session["floor"]["peaks_db"], metrics["peaks_db"])
+            proposal["fx"].update(calibrate.analyze_tone(session["floor"], metrics))
+            return proposal
+        future = self._calibration_executor.submit(measure)
+        future.add_done_callback(lambda completed: GLib.idle_add(
+            self._calibration_complete, session, speech, completed))
+
+    def _calibration_complete(self, session, speech, future):
+        if self._calibration is not session or self._shutting_down:
+            return False
+        dialog, session["dialog"] = session["dialog"], None
+        dialog.close()
+        try:
+            result = future.result()
+        except calibrate.CalibrationCancelled:
+            self._cancel_calibration()
+            return False
+        except (calibrate.CalibrationError, OSError, ValueError) as error:
+            self._cancel_calibration()
+            self._show_error("Calibration could not produce safe settings", error)
+            return False
+        if not speech:
+            session["floor"] = result
+            self._calibration_prompt(session, speech=True)
+            return False
+        self._review_calibration(session, result)
+        return False
+
+    def _review_calibration(self, session, proposal):
+        measured, settings = proposal["measured"], proposal["fx"]
+        summary = (
+            f"Noise floor: {measured['floor_db']:.1f} dB\n"
+            f"Quiet / loud speech: {measured['quiet_voice_db']:.1f} / "
+            f"{measured['loud_voice_db']:.1f} dB\n\n"
+            f"Gate: {settings['gate_thresh']:.1f} dB\n"
+            f"Compressor: {settings['comp_thresh']:.1f} dB, {settings['comp_ratio']:.1f}:1\n"
+            f"Low cut: {settings['lowcut']} Hz\nHigh shelf: {settings['eq_high']:+.0f} dB"
+        )
+        if settings.get("mono"):
+            summary += "\nMono: enabled (one channel is very quiet)"
+        dialog = Adw.AlertDialog(heading="Review calibration", body=summary)
+        session["dialog"] = dialog
+        dialog.add_response("cancel", "Keep current settings")
+        dialog.add_response("apply", "Apply")
+        dialog.set_response_appearance("apply", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("cancel")
+        def response(alert, result):
+            answer = alert.choose_finish(result)
+            if self._calibration is not session:
+                return
+            self._calibration = None
+            if answer != "apply":
+                return
+            source = self._sources.get(session["source_id"])
+            capture = next((item for item in self.mixer.capture_sources()
+                            if item["name"] == session["node_name"]), None)
+            if (source is None or source.get("node_name") != session["node_name"]
+                    or capture is None or capture["identity"] != session["identity"]):
+                self._show_error("Calibration expired", "The input changed. Repeat the measurements.")
+                return
+            try:
+                self._set_source_fx(session["source_id"], {**effects.fx(source), **settings})
+            except (OSError, ValueError) as error:
+                self._show_error("Unable to apply calibration", error)
+        dialog.choose(self, None, response)
+
     def scene_names(self):
         return {sid: scene["name"] for sid, scene in scenes_module.load().items()}
 
@@ -1601,7 +1795,8 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         levels = self.mixer.scene_state()
         return json.dumps({
             "sources": [dict(id=sid, name=source["name"], kind=sources_module.kind(source),
-                             group=sources_module.group(source), **levels["sources"][sid])
+                             group=sources_module.group(source), fx=effects.fx(source),
+                             **levels["sources"][sid])
                         for sid, source in self._sources.items()],
             "mixes": [dict(id=mid, name=mix["name"], sink=mix["sink"])
                       for mid, mix in self._mixes.items()],
@@ -1640,6 +1835,7 @@ class WaveXLRApp(Adw.Application):
             "apply-scene": ("s", "apply_scene"),
             "save-scene": ("s", "save_scene"),
             "delete-scene": ("s", "delete_scene"),
+            "toggle-fx": ("(ss)", "toggle_fx"),
         }
         for name, (signature, method) in mutations.items():
             action = Gio.SimpleAction.new(name, GLib.VariantType.new(signature))
