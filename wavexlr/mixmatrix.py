@@ -21,6 +21,7 @@ gi.require_version("Adw", "1")
 from gi.repository import Gtk, Adw, GObject, Gdk, GLib, Pango  # noqa: E402
 
 from . import icons
+from .effects import FX_RANGES
 
 
 def _emit_later(obj, signal, *args):
@@ -995,7 +996,7 @@ class SourceCell(Gtk.Box):
             r.append(widget)
             box.append(r)
 
-        auto_btn = Gtk.Button(label="Auto-calibrate gate + comp")
+        auto_btn = Gtk.Button(label="Auto-calibrate microphone")
         # Defer calibration until the popover's Wayland grab is released.
         auto_btn.connect("clicked",
                          lambda _b: (pop.popdown(),
@@ -1027,14 +1028,14 @@ class SourceCell(Gtk.Box):
 
         self._fx_gate = switch()
         row("Gate", self._fx_gate)
-        self._fx_gate_thresh = scale(-70, -20, 1)
+        self._fx_gate_thresh = scale(*FX_RANGES["gate_thresh"], 1)
         row("Gate dB", self._fx_gate_thresh)
 
         self._fx_comp = switch()
         row("Comp", self._fx_comp)
-        self._fx_comp_thresh = scale(-40, 0, 1)
+        self._fx_comp_thresh = scale(*FX_RANGES["comp_thresh"], 1)
         row("Comp dB", self._fx_comp_thresh)
-        self._fx_comp_ratio = scale(1, 10, 0.5, digits=1)
+        self._fx_comp_ratio = scale(*FX_RANGES["comp_ratio"], 0.5, digits=1)
         row("Ratio", self._fx_comp_ratio)
 
         # A slider whose effect is off is either misleading (it moves,
@@ -1099,7 +1100,7 @@ class SourceCell(Gtk.Box):
         self.emit(self.__FX_SIGNAL)
 
     def fx_settings(self):
-        """The popover's current values, in the sources.DEFAULT_FX shape."""
+        """The popover's current values in the effects.DEFAULT_FX schema."""
         lowcut = (0, 80, 120)[self._fx_lowcut.get_selected()]
         return {
             "lowcut": lowcut,

@@ -13,6 +13,7 @@ import time
 from collections.abc import Mapping
 
 from .effects import FX_NODE_PREFIX, fx
+from . import child
 
 
 RATE = 48000
@@ -94,10 +95,9 @@ def _capture(node_name, seconds, channels, cancel):
     _check_cancel(cancel)
     deadline = time.monotonic() + seconds + 0.5 + GRACE_SECONDS
     try:
-        # No preexec_fn: this is called in threaded Python. No new session or
-        # detached process; ownership starts as soon as Popen returns, including
-        # when cancellation was requested during process creation.
-        proc = subprocess.Popen(
+        # Parent-death setup runs in a fresh interpreter, not threaded preexec.
+        # Cancellation during spawn still transfers ownership to this worker.
+        proc = child.spawn(
             ["pw-cat", "--record", "--target", node_name,
              "--rate", str(RATE), "--channels", str(channels),
              "--format", "s16", "--properties",

@@ -14,8 +14,10 @@ import os
 import subprocess
 import threading
 import uuid
+import tempfile
+import time
 
-from . import child, mixes as mix_store, sources
+from . import child, effects, mixes as mix_store, sources
 
 _log = logging.getLogger(__name__)
 CONFIG_PATH = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "openwave", "mixes.json")
@@ -245,6 +247,11 @@ class SubprocessPipeWire:
         except OSError:
             return None
 
+    @staticmethod
+    def spawn_filter(config_path):
+        return child.spawn(["pipewire", "-c", config_path],
+                           stdout=subprocess.DEVNULL)
+
 
 class Mixer:
     """Desired state setters enqueue work; stop is a synchronous drain barrier.
@@ -306,6 +313,10 @@ class Mixer:
         self._graph = None
         self._error = None
         self._procs = {}
+        self._effects = {}
+        self._effects_retry = {}
+        self._effects_directory = None
+        self._effects_error = None
         self._owned_sinks = {}
         self._moved = {}
         self.mic = self.hp = None
@@ -575,7 +586,7 @@ class Mixer:
                     self._discover(graph)
                     self._reconcile(graph)
                     with self._lock:
-                        self._error = None
+                        self._error = self._effects_error
                 except Exception as exc:
                     with self._lock:
                         self._error = str(exc)
@@ -653,6 +664,73 @@ class Mixer:
         route = self._procs.pop(key, None)
         if route is not None:
             self._reap(route["proc"])
+
+    def _drop_effect(self, source_id):
+        effect = self._effects.pop(source_id, None)
+        if effect is not None:
+            self._reap(effect["proc"])
+            try:
+                os.unlink(effect["path"])
+            except FileNotFoundError:
+                pass
+
+    def _sync_effects(self, graph, records):
+        """An unavailable requested chain is silent, never an implicit raw bypass."""
+        effective, wanted, errors = {}, set(), []
+        captures = {item["name"]: item for item in graph["captures"]}
+        now = time.monotonic()
+        for sid, source in records.items():
+            if sources.kind(source) != sources.KIND_DEVICE or not effects.fx_active(source):
+                continue
+            effective[sid] = None
+            capture = captures.get(source["node_name"])
+            if capture is None:
+                continue
+            wanted.add(sid)
+            settings = effects.fx(source)
+            spec = (capture.get("identity"), source["node_name"], source["name"],
+                    source.get("channels", 2), tuple(settings.items()))
+            current = self._effects.get(sid)
+            if current is not None and (current["spec"] != spec or current["proc"].poll() is not None):
+                self._drop_effect(sid)
+                current = None
+            if current is None:
+                previous, retry_after = self._effects_retry.get(sid, (None, 0))
+                if previous == spec and now < retry_after:
+                    errors.append(f"Effects unavailable for {source['name']}; retrying shortly")
+                    continue
+                self._effects_retry[sid] = (spec, now + 5)
+                try:
+                    owner = uuid.uuid4().hex
+                    rendered = effects.render_fx_config(source, owner=owner)
+                    if self._effects_directory is None:
+                        self._effects_directory = tempfile.TemporaryDirectory(prefix="openwave-fx-")
+                    path = os.path.join(self._effects_directory.name, sid + ".conf")
+                    with open(path, "w", encoding="utf-8") as file:
+                        file.write(rendered)
+                    proc = self._pw.spawn_filter(path)
+                    current = {"proc": proc, "path": path, "spec": spec, "owner": owner,
+                               "name": effects.fx_node_name(sid), "started": now}
+                    self._effects[sid] = current
+                except (OSError, ValueError, GraphError) as error:
+                    errors.append(f"Effects unavailable for {source['name']}: {error}")
+                    continue
+            node = graph["nodes"].get(current["name"])
+            if node and node.get("props", {}).get("openwave.owner") == current["owner"]:
+                effective[sid] = current["name"]
+            elif now - current["started"] > 5:
+                self._drop_effect(sid)
+                errors.append(f"Effects failed to initialize for {source['name']}")
+            else:
+                errors.append(f"Starting effects for {source['name']}")
+        for sid in list(self._effects):
+            if sid not in wanted:
+                self._drop_effect(sid)
+        for sid in list(self._effects_retry):
+            if sid not in wanted:
+                del self._effects_retry[sid]
+        self._effects_error = "; ".join(errors) or None
+        return effective
 
     def _route(self, key, source, target, name, volume, muted, graph, *, publish=False, description=None):
         spec = (source, target, publish, description)
@@ -755,6 +833,7 @@ class Mixer:
         ready = {mid for mid, mix in mixes.items() if self._ensure_sink(mix["sink"], mix["description"], graph)}
         ready &= self._sync_masters(graph, mixes)
         claims = claim_streams(records, graph["streams"])
+        processed = self._sync_effects(graph, records)
         desired = set()
         # Silence departing/muted sends before any group hand-over opens another.
         for key, route in list(self._procs.items()):
@@ -788,6 +867,9 @@ class Mixer:
             else:
                 capture = source.get("node_name")
                 if capture not in {item["name"] for item in graph["captures"]}:
+                    continue
+                capture = processed.get(sid, capture)
+                if capture is None:
                     continue
             for mid in ready:
                 cell = state.get(f"{sid}.{mid}", {})
@@ -849,6 +931,11 @@ class Mixer:
     def _teardown(self):
         for key in list(self._procs):
             self._drop_route(key)
+        for sid in list(self._effects):
+            self._drop_effect(sid)
+        if self._effects_directory is not None:
+            self._effects_directory.cleanup()
+            self._effects_directory = None
         try:
             graph = self._pw.snapshot()
             self._restore_streams(graph, {})

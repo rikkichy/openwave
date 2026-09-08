@@ -97,7 +97,7 @@ def fx_node_name(source_id):
     return FX_NODE_PREFIX + source_id
 
 
-def render_fx_config(source):
+def render_fx_config(source, *, owner=None):
     """Return a SPA-safe JSON PipeWire config, or None for exact raw bypass.
 
     Unknown inputs are stereo. Set source['channels']=1 only for a known mono
@@ -204,6 +204,11 @@ def render_fx_config(source):
             "audio.channels": output_channels, "audio.position": output_position,
         },
     }
+    if owner is not None:
+        if not isinstance(owner, str) or not owner or "\0" in owner:
+            raise ValueError("invalid effect owner")
+        args["capture.props"]["openwave.owner"] = owner
+        args["playback.props"]["openwave.owner"] = owner
     # JSON is valid SPA syntax; serialize every string, including all metadata.
     return json.dumps({
         "context.properties": {"log.level": 2},

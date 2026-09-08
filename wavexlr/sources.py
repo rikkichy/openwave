@@ -8,6 +8,8 @@ import re
 import tempfile
 import uuid
 
+from . import effects
+
 CONFIG_PATH = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "openwave", "sources.json")
 KIND_APP = "app"
 KIND_DEVICE = "device"
@@ -92,6 +94,8 @@ def normalize(records):
         for field in ("name", "icon_name", "group", "node_name"):
             if not isinstance(source[field], str):
                 raise ValueError(f"Source {field} must be a string")
+        if "fx" in source:
+            source["fx"] = effects.fx(source)
         source["group"] = group(source)
         if source["group"] and not source["muted"]:
             if source["group"] in live_groups:
