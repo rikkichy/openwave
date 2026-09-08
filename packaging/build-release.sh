@@ -34,7 +34,7 @@ Version: $V
 Section: sound
 Priority: optional
 Architecture: all
-Depends: python3 (>= 3.10), python3-gi, gir1.2-gtk-4.0, gir1.2-adw-1, libadwaita-1-0, adwaita-icon-theme, libusb-1.0-0, pipewire, pipewire-bin, wireplumber, alsa-utils, pulseaudio-utils, swh-plugins
+Depends: python3 (>= 3.10), python3-gi, gir1.2-gtk-4.0, gir1.2-adw-1, libadwaita-1-0, adwaita-icon-theme, libusb-1.0-0, pipewire, pipewire-bin, wireplumber, alsa-utils, pulseaudio-utils, swh-plugins, pkexec
 Maintainer: rikkichy <rikkichy@users.noreply.github.com>
 Homepage: https://github.com/rikkichy/openwave
 Description: Elgato Wave control panel and PipeWire mixing matrix

@@ -12,6 +12,7 @@ Requires:       python3-gobject
 Requires:       gtk4
 Requires:       libadwaita
 Requires:       adwaita-icon-theme
+Requires:       polkit
 Requires:       libusb1
 Requires:       pipewire
 Requires:       pipewire-utils
