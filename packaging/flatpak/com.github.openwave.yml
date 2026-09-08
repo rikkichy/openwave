@@ -190,6 +190,9 @@ modules:
       - make install PREFIX=/app PYTHON=python3 SITEPKG=/app/share/openwave/site-packages
       - /app/bin/openwave --version
       - /app/bin/openwave-daemon --help
+      - /app/bin/openwave-diag --help
+      - /app/bin/openwave-diag --version
+      - /app/bin/openwave-probe --help
       - test -x /app/bin/pactl && test -x /app/bin/wpctl && test -x /app/bin/pw-top && test -x /app/bin/pw-cat
       - test -f /app/lib/ladspa/gate_1410.so && test -f /app/lib/ladspa/sc4m_1916.so
     sources:

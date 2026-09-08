@@ -9,12 +9,14 @@ trap 'rm -rf "$WORK"' EXIT HUP INT TERM
 export HOME="$WORK" XDG_CONFIG_HOME="$WORK/config" XDG_DATA_HOME="$WORK/data"
 export PYTHONDONTWRITEBYTECODE=1
 cd "$WORK"
-for launcher in openwave openwave-daemon; do
+for launcher in openwave openwave-daemon openwave-diag; do
     timeout 15 "$PREFIX/bin/$launcher" --help
     actual=$(timeout 15 "$PREFIX/bin/$launcher" --version)
     expected=$(cat "$PREFIX/share/openwave/VERSION")
     case "$actual" in *"$expected"*) ;; *) echo "Wrong installed version: $actual" >&2; exit 1;; esac
 done
+# Probe help parses arguments before opening a device; never run dump/poke here.
+timeout 15 "$PREFIX/bin/openwave-probe" --help
 export PYTHONPATH="$SITEPKG"
 "$PYTHON" - "$PREFIX" <<'PY'
 import importlib

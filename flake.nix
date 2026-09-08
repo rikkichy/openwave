@@ -76,13 +76,14 @@
                 --prefix XDG_DATA_DIRS : ${pkgs.adwaita-icon-theme}/share \
                 "''${gappsWrapperArgs[@]}"
 
-              # The Makefile installs this launcher too; it just needs the same
-              # import path as the GUI one. service.py points ExecStart at it.
-              wrapProgram $out/bin/openwave-daemon \
-                --prefix PYTHONPATH : $out/${sitePkgs} \
-                --prefix LD_LIBRARY_PATH : ${usbLibs} \
-                --prefix PATH : ${runtimeBins} \
-                --prefix LADSPA_PATH : ${pkgs.swh-plugins}/lib/ladspa
+              # Every CLI needs the private module tree, libusb and worker tools.
+              for launcher in openwave-daemon openwave-diag openwave-probe; do
+                wrapProgram $out/bin/$launcher \
+                  --prefix PYTHONPATH : $out/${sitePkgs} \
+                  --prefix LD_LIBRARY_PATH : ${usbLibs} \
+                  --prefix PATH : ${runtimeBins} \
+                  --prefix LADSPA_PATH : ${pkgs.swh-plugins}/lib/ladspa
+              done
             '';
 
             meta = {

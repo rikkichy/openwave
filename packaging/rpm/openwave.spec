@@ -35,6 +35,8 @@ make install DESTDIR=%{buildroot} PREFIX=/usr PYTHON=python3 \
 %files
 /usr/bin/openwave
 /usr/bin/openwave-daemon
+/usr/bin/openwave-diag
+/usr/bin/openwave-probe
 /usr/share/openwave/
 /usr/share/applications/openwave.desktop
 /usr/share/metainfo/com.github.openwave.metainfo.xml
