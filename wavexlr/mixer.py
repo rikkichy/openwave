@@ -1,15 +1,13 @@
-"""Audio mixer — manages pw-loopback subprocesses for the matrix.
+"""Worker-owned PipeWire routing. Public reads are detached cached snapshots.
 
-A loopback exists for each non-zero cell in the matrix (mic → mix), plus one
-that always routes Personal Mix → Wave XLR headphones so the user hears
-anything routed there. Volume + mute per cell are pushed onto the loopback's
-playback node via wpctl.
-
-State is persisted to ~/.config/openwave/mixes.json so per-cell levels survive
-restarts (the loopbacks themselves do not — they're respawned by start()).
+A configured application owns an intake even with all sends at zero: its audio
+cannot bypass a zero fader. One deterministic claim and one move replace copying
+an application's already-playing output. Graph observations, not child liveness,
+determine whether links and levels need repair.
 """
 
 import atexit
+import copy
 import ctypes
 import json
 import logging
@@ -17,494 +15,511 @@ import os
 import signal
 import subprocess
 import threading
-import time
-from threading import Event, Lock
+import uuid
+
+from . import sources
 
 _log = logging.getLogger(__name__)
-
-# Linux-only: make spawned children receive SIGTERM if our process dies.
-# Survives SIGKILL on the parent, hard crashes, anything that skips Python
-# cleanup paths. Without this, pw-loopback children leak on unclean exit.
-_PR_SET_PDEATHSIG = 1
+CONFIG_PATH = os.path.expanduser("~/.config/openwave/mixes.json")
+MIX_SINKS = {"personal": "openwave_personal_mix", "chat": "openwave_chat_mix", "record": "openwave_record_mix"}
+CARD_NAME_TOKENS = ("Elgato_Wave_", "Elgato_XLR_Dock")
 try:
-    _libc = ctypes.CDLL("libc.so.6", use_errno=True)
-    _libc.prctl.argtypes = (
-        ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong,
-    )
-    _libc.prctl.restype = ctypes.c_int
-except (OSError, AttributeError):
+    _libc = ctypes.CDLL(None, use_errno=True)
+except OSError:
     _libc = None
 
 
 def _set_pdeathsig():
     if _libc is not None:
-        _libc.prctl(_PR_SET_PDEATHSIG, int(signal.SIGTERM), 0, 0, 0)
-
-CONFIG_PATH = os.path.expanduser("~/.config/openwave/mixes.json")
-
-MIX_SINKS = {
-    "personal": "openwave_personal_mix",
-    "chat":     "openwave_chat_mix",
-    "record":   "openwave_record_mix",
-}
-PERSONAL_MIX_SINK = "openwave_personal_mix"
-HP_LOOPBACK_KEY = "_personal_to_hp"
-HP_LOOPBACK_NODE = "openwave_loop_personal_to_hp"
+        _libc.prctl(1, int(signal.SIGTERM), 0, 0, 0)
+        if os.getppid() == 1:
+            os.kill(os.getpid(), signal.SIGTERM)
 
 
-def _pactl_short(kind):
-    try:
-        r = subprocess.run(
-            ["pactl", "list", "short", kind],
-            capture_output=True, text=True, timeout=3,
-        )
-    except (FileNotFoundError, subprocess.SubprocessError):
-        return []
-    return [line.split("\t") for line in r.stdout.splitlines() if line.strip()]
+def properties(values):
+    """SPA property object; JSON quoting also escapes untrusted display labels."""
+    return "{ " + " ".join(f"{key} = {json.dumps(value, ensure_ascii=True, allow_nan=False)}" for key, value in values.items()) + " }"
 
-
-CARD_NAME_TOKENS = ("Elgato_Wave_", "Elgato_XLR_Dock")
 
 
 def _is_wave_card(node_name):
-    """Whether a PipeWire ALSA node belongs to a supported Wave family."""
     return any(token in node_name for token in CARD_NAME_TOKENS)
 
-
-def find_wave_xlr_alsa():
-    """Return (mic_node_name, hp_node_name); either may be None if unplugged."""
-    mic = next(
-        (p[1] for p in _pactl_short("sources")
-         if len(p) > 1 and p[1].startswith("alsa_input") and _is_wave_card(p[1])),
-        None,
-    )
-    hp = next(
-        (p[1] for p in _pactl_short("sinks")
-         if len(p) > 1 and p[1].startswith("alsa_output") and _is_wave_card(p[1])),
-        None,
-    )
-    return mic, hp
+def source_sink_name(source_id):
+    return "openwave_src_" + sources.safe_id(source_id)
 
 
-def _node_id_by_name(name, retries=20):
-    """Look up a PipeWire node's global id by node.name, polling briefly so
-    we don't race a just-spawned pw-loopback. Returns None if not found."""
-    for _ in range(retries):
-        try:
-            r = subprocess.run(
-                ["pw-cli", "ls", "Node"],
-                capture_output=True, text=True, timeout=3,
-            )
-        except (FileNotFoundError, subprocess.SubprocessError):
-            return None
-        current_id = None
-        for raw in r.stdout.splitlines():
-            line = raw.strip()
-            if line.startswith("id "):
-                try:
-                    current_id = line.split()[1].rstrip(",")
-                except (IndexError, ValueError):
-                    current_id = None
-            elif current_id and line == f'node.name = "{name}"':
-                return current_id
-        time.sleep(0.05)
-    return None
+def _normalize(value):
+    return " ".join(str(value or "").split()).casefold()
 
 
-def _wpctl(*args):
-    try:
-        subprocess.run(
-            ["wpctl", *args],
-            capture_output=True, text=True, timeout=3,
-        )
-    except (FileNotFoundError, subprocess.SubprocessError):
-        pass
+def _match_rank(source, stream):
+    if sources.kind(source) != sources.KIND_APP:
+        return None
+    wanted = {_normalize(name) for name in sources.bindings(source)} - {""}
+    binary = str(stream.get("binary") or "")
+    identities = (stream.get("app_name"), stream.get("node_name"), binary, os.path.basename(binary))
+    return next((rank for rank, identity in enumerate(identities) if _normalize(identity) in wanted), None)
 
 
-def _ports(direction_flag, node_name):
-    """Return the list of `node:port` strings for one direction of a node.
+def stream_matches(source, stream):
+    return _match_rank(source, stream) is not None
 
-    direction_flag is '-i' (inputs) or '-o' (outputs). Filters pw-link's
-    global output to ports whose node.name equals `node_name`.
+
+def claim_streams(records, streams):
+    """Exact normalized identity matches; specificity then stable id break ties."""
+    claims = {sid: set() for sid in records}
+    fallback = sorted(sid for sid, source in records.items() if sources.kind(source) == sources.KIND_APP and source.get("catch_all"))
+    for stream_id, stream in streams.items():
+        candidates = []
+        for sid, source in records.items():
+            rank = _match_rank(source, stream)
+            if rank is not None:
+                candidates.append((rank, sid))
+        owner = min(candidates)[1] if candidates else (fallback[0] if fallback else None)
+        if owner is not None:
+            claims[owner].add(stream_id)
+    return claims
+
+
+class GraphError(RuntimeError):
+    """A command failed or a graph snapshot is incomplete; retry next cycle."""
+
+
+class SubprocessPipeWire:
+    """Single worker's process boundary. Mutation methods return success only.
+
+    Discovery raises GraphError rather than returning an empty graph on failure.
+    Module handles include an unguessable owner token so a restarted server's
+    reused module index can never authorize deletion of someone else's resource.
     """
-    try:
-        r = subprocess.run(
-            ["pw-link", direction_flag],
-            capture_output=True, text=True, timeout=3,
-        )
-    except (FileNotFoundError, subprocess.SubprocessError):
-        return []
-    prefix = f"{node_name}:"
-    return [line.strip() for line in r.stdout.splitlines() if line.strip().startswith(prefix)]
 
+    @staticmethod
+    def run(argv):
+        try:
+            result = subprocess.run(argv, capture_output=True, text=True, timeout=3)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise GraphError(str(exc)) from exc
+        if result.returncode:
+            raise GraphError(f"{argv[0]} exited {result.returncode}: {result.stderr.strip()}")
+        return result.stdout
 
-def list_audio_streams():
-    """Return [{id, app_name, media_name, node_name}, ...] for active output streams."""
-    import json as _json
-    try:
-        r = subprocess.run(
-            ["pw-dump"], capture_output=True, text=True, timeout=5,
-        )
-        if r.returncode != 0:
-            return []
-        objects = _json.loads(r.stdout)
-    except (FileNotFoundError, subprocess.SubprocessError, _json.JSONDecodeError):
-        return []
+    def command(self, argv):
+        try:
+            self.run(argv)
+            return True
+        except GraphError as exc:
+            _log.warning("%s", exc)
+            return False
 
-    out = []
-    for obj in objects:
-        if obj.get("type") != "PipeWire:Interface:Node":
-            continue
-        props = (obj.get("info") or {}).get("props") or {}
-        if props.get("media.class") != "Stream/Output/Audio":
-            continue
-        app = props.get("application.name") or props.get("node.name") or "Unknown"
-        # Skip our own loopbacks
-        node_name = props.get("node.name", "")
-        if node_name.startswith("openwave_"):
-            continue
-        out.append({
-            "id": obj["id"],
-            "app_name": app,
-            "media_name": props.get("media.name", ""),
-            "node_name": node_name,
-            "binary": props.get("application.process.binary", ""),
-        })
-    return out
+    def snapshot(self):
+        try:
+            objects = json.loads(self.run(["pw-dump"]))
+            pulse = {kind: json.loads(self.run(["pactl", "--format=json", "list", kind]))
+                     for kind in ("sinks", "sources", "sink-inputs", "modules")}
+            if not isinstance(objects, list) or any(not isinstance(items, list) for items in pulse.values()):
+                raise ValueError("Expected graph arrays")
+            default = self.run(["pactl", "get-default-sink"]).strip()
+            nodes = {}
+            ports = {}
+            links = set()
+            for obj in objects:
+                info = obj.get("info") or {}
+                props = info.get("props") or {}
+                typ = obj.get("type", "").rsplit(":", 1)[-1]
+                if typ == "Node":
+                    name = props.get("node.name", "")
+                    nodes[name] = {"id": obj["id"], "serial": str(props.get("object.serial", obj["id"])), "props": props}
+                elif typ == "Port":
+                    key = (str(props.get("node.id")), props.get("port.direction"))
+                    ports.setdefault(key, []).append({"id": obj["id"], "channel": props.get("audio.channel", "")})
+                elif typ == "Link":
+                    links.add((info["output-port-id"], info["input-port-id"]))
+            sinks = {}
+            for sink in pulse["sinks"]:
+                node = nodes.get(sink["name"])
+                if node is None:
+                    continue
+                volumes = [v["value"] / 65536 for v in sink.get("volume", {}).values()]
+                sinks[sink["name"]] = {"name": sink["name"], "index": sink["index"], "description": sink.get("description", sink["name"]),
+                    "identity": node["serial"], "volume": max(volumes, default=1.0), "muted": bool(sink.get("mute")),
+                    "priority": int(node["props"].get("priority.session", 0))}
+            sink_indices = {str(sink["index"]): name for name, sink in sinks.items()}
+            inputs = {str(item.get("properties", {}).get("object.serial", "")): item for item in pulse["sink-inputs"]}
+            streams = {}
+            captures = []
+            for name, node in nodes.items():
+                props = node["props"]
+                media_class = props.get("media.class", "")
+                if media_class == "Stream/Output/Audio" and not name.startswith("openwave_"):
+                    pulse_input = inputs.get(node["serial"], {})
+                    streams[node["id"]] = {"id": node["id"], "serial": node["serial"],
+                        "pulse_id": pulse_input.get("index"), "sink": sink_indices.get(str(pulse_input.get("sink"))),
+                        "app_name": props.get("application.name") or name, "node_name": name,
+                        "media_name": props.get("media.name", ""), "binary": props.get("application.process.binary", "")}
+                if media_class == "Audio/Source" and not name.startswith("openwave_") and not name.endswith(".monitor"):
+                    captures.append({"name": name, "description": props.get("node.description", name), "priority": int(props.get("priority.session", 0))})
+            mutes = {item["name"]: bool(item.get("mute")) for item in pulse["sources"]}
+            return {"nodes": nodes, "ports": ports, "links": links, "sinks": sinks, "streams": streams,
+                    "captures": captures, "capture_mutes": mutes, "modules": pulse["modules"], "default": default}
+        except (ValueError, TypeError, KeyError) as exc:
+            raise GraphError(f"Malformed PipeWire snapshot: {exc}") from exc
+
+    def move_stream(self, stream, sink):
+        # Native streams also appear in pipewire-pulse's sink-input listing.
+        # Never guess an index or copy a stream whose move was rejected.
+        index = stream.get("pulse_id")
+        return index is not None and self.command(["pactl", "move-sink-input", str(index), sink])
+
+    def link(self, source_port, target_port):
+        return self.command(["pw-link", str(source_port), str(target_port)])
+
+    def set_level(self, node_id, volume, muted):
+        volume_ok = self.command(["wpctl", "set-volume", str(node_id), str(volume)])
+        mute_ok = self.command(["wpctl", "set-mute", str(node_id), "1" if muted else "0"])
+        return volume_ok and mute_ok
+
+    def create_sink(self, name, description):
+        token = uuid.uuid4().hex
+        props = properties({"node.description": description, "media.name": name, "openwave.owner": token,
+                            "priority.session": 0, "monitor.channel-volumes": True})
+        try:
+            module_id = int(self.run(["pactl", "load-module", "module-null-sink", "sink_name=" + name,
+                                      "channels=2", "channel_map=front-left,front-right", "sink_properties=" + props]).strip())
+        except (GraphError, ValueError):
+            return None
+        return (module_id, token)
+
+    def destroy_sink(self, handle, graph):
+        module_id, token = handle
+        owned = any(str(module.get("index")) == str(module_id) and token in str(module.get("argument", "")) for module in graph["modules"])
+        return not owned or self.command(["pactl", "unload-module", str(module_id)])
+
+    @staticmethod
+    def spawn_loopback(name, publish=False, description=None):
+        capture_name = name + "_cap"
+        capture = {"node.name": capture_name, "media.name": capture_name, "node.autoconnect": False,
+                   "audio.channels": 2, "audio.position": ["FL", "FR"]}
+        playback = {"node.name": name, "media.name": name, "node.autoconnect": False,
+                    "audio.channels": 2, "audio.position": ["FL", "FR"]}
+        if publish:
+            playback.update({"media.class": "Audio/Source", "node.virtual": True,
+                             "node.description": description or name})
+        try:
+            return subprocess.Popen(["pw-loopback", "--capture-props=" + properties(capture),
+                                     "--playback-props=" + properties(playback)], stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, preexec_fn=_set_pdeathsig)
+        except OSError:
+            return None
 
 
 class Mixer:
-    """Manages pw-loopback subprocesses for the matrix's mic row."""
+    """Desired state setters enqueue work; stop is a synchronous drain barrier.
 
-    def __init__(self):
-        self._lock = Lock()
-        self._procs = {}
-        self._state = self._load_state()
-        self._sources = {}
-        self._streams = {}
-        self.mic, self.hp = find_wave_xlr_alsa()
+    A failed discovery leaves the last snapshot intact. Failed moves, links and
+    levels are retried every poll; no success is inferred from a living child.
+    """
 
-        # Background worker: every operation that talks to pw-loopback /
-        # pw-cli / wpctl runs here so the GTK main thread never blocks on a
-        # subprocess. Pending work is a dict keyed by (kind, …) so successive
-        # set_cell calls on the same cell collapse to a single reconcile.
-        self._pending = {}
-        self._pending_lock = Lock()
-        self._wake = Event()
-        self._worker_running = True
-        self._worker = threading.Thread(
-            target=self._worker_loop, name="openwave-mixer", daemon=True,
-        )
-        self._worker.start()
-
-        # Belt-and-suspenders: even if do_shutdown is skipped, the interpreter
-        # almost always runs atexit before the process image goes away.
-        atexit.register(self._atexit_cleanup)
-
-    # ----- worker thread -----
-    def _enqueue(self, key, task):
-        """Coalesce a task by key. Latest task for the same key wins."""
-        with self._pending_lock:
-            self._pending[key] = task
-            self._wake.set()
-
-    def _worker_loop(self):
-        while self._worker_running:
-            self._wake.wait(timeout=1.0)
-            while True:
-                with self._pending_lock:
-                    if not self._pending:
-                        self._wake.clear()
-                        break
-                    key = next(iter(self._pending))
-                    task = self._pending.pop(key)
-                try:
-                    task()
-                except Exception:
-                    _log.exception("mixer task failed: %s", key)
-            if not self._worker_running:
-                return
-
-    # ----- persistence -----
-    def _load_state(self):
+    def __init__(self, pw=None, *, config_path=None, poll_interval=1.0):
+        self._pw = pw or SubprocessPipeWire()
+        self._path = config_path or CONFIG_PATH
+        self._lock = threading.RLock()
+        self._save_lock = threading.Lock()
+        self._wake = threading.Event()
+        self._stopping = threading.Event()
+        self._thread = None
+        self._closed = False
+        self._poll_interval = poll_interval
         try:
-            with open(CONFIG_PATH) as f:
-                return json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            return {}
+            with open(self._path) as f:
+                self._state = json.load(f)
+            if not isinstance(self._state, dict):
+                raise ValueError("Matrix state must be an object")
+            for key, cell in self._state.items():
+                if "." in key:
+                    sid, mid = key.split(".")
+                    sources.safe_id(sid)
+                    sources.safe_id(mid)
+                    cell["volume"] = sources.level(cell.get("volume", 0))
+                    cell["muted"] = bool(cell.get("muted", False))
+        except FileNotFoundError:
+            self._state = {}
+        self._sources = {}
+        self._mixes = {mid: {"id": mid, "sink": sink, "name": mid.title() + " Mix", "description": "OpenWave " + mid.title() + " Mix"} for mid, sink in MIX_SINKS.items()}
+        self._graph = None
+        self._error = None
+        self._procs = {}
+        self._owned_sinks = {}
+        self._moved = {}
+        self.mic = self.hp = None
+        self._reported_streams = set()
+        atexit.register(self.stop)
 
-    def _save_state(self):
-        os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
-        tmp = CONFIG_PATH + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(self._state, f, indent=2)
-        os.replace(tmp, CONFIG_PATH)
+    def _persist(self):
+        with self._save_lock:
+            with self._lock:
+                state = copy.deepcopy(self._state)
+            sources._atomic_write(self._path, state)
 
     def get_cell(self, source_id, mix_id):
-        return self._state.get(
-            f"{source_id}.{mix_id}", {"volume": 0.0, "muted": False}
-        )
+        with self._lock:
+            return dict(self._state.get(f"{source_id}.{mix_id}", {"volume": 0.0, "muted": False}))
 
     def cells(self):
-        return dict(self._state)
+        with self._lock:
+            return copy.deepcopy({key: value for key, value in self._state.items() if "." in key})
 
     def streams(self):
-        """Snapshot of currently-known PipeWire output streams (id → info)."""
         with self._lock:
-            return dict(self._streams)
+            return copy.deepcopy(self._graph["streams"] if self._graph else {})
 
-    # ----- subprocess lifecycle -----
-    def _spawn_loopback(self, key, capture_source_name, playback_target, node_name):
-        """Spawn a pw-loopback and *manually* link the capture side to
-        `capture_source_name`'s output ports. We disable autoconnect on capture
-        because the session manager will otherwise hijack the loopback by
-        wiring the default source (the Wave XLR mic) into it whenever
-        target.object can't be resolved to a Source node — which is exactly
-        the case for null-sink monitors. The link is set up after a brief
-        wait so the node has time to register.
-        """
-        if key in self._procs:
-            return
-        capture_node_name = f"{node_name}_cap"
+    def last_error(self):
+        with self._lock:
+            return self._error
+
+    def set_cell(self, source_id, mix_id, volume, muted):
+        sources.safe_id(source_id)
+        sources.safe_id(mix_id)
+        volume = sources.level(volume)
+        with self._lock:
+            self._state[f"{source_id}.{mix_id}"] = {"volume": volume if volume >= 0.01 else 0.0, "muted": bool(muted)}
+        self._persist()
+        self._wake.set()
+
+    def set_sources(self, records):
+        normalized = sources.normalize(records)
+        with self._lock:
+            self._sources = normalized
+        self._wake.set()
+
+    def set_source_level(self, source_id, volume, muted):
+        value = sources.level(volume)
+        with self._lock:
+            self._sources[source_id].update(level=value, muted=bool(muted))
+        # Source records are persisted by their store owner, not by this worker.
+        self._wake.set()
+
+    def remove_source(self, source_id):
+        with self._lock:
+            if sources.is_protected(self._sources.get(source_id, {})):
+                raise ValueError("Protected source cannot be removed")
+            self._sources.pop(source_id, None)
+            self._state = {key: value for key, value in self._state.items() if not key.startswith(source_id + ".")}
+        self._persist()
+        self._wake.set()
+
+    def request_stream_poll(self):
+        self._wake.set()
+
+    def poll_streams(self):
+        """Compatibility for current UI; deltas concern cached observations only."""
+        self.request_stream_poll()
+        current = set(self.streams())
+        added, removed = current - self._reported_streams, self._reported_streams - current
+        self._reported_streams = current
+        return added, removed
+
+    def start(self):
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("A stopped Mixer cannot restart")
+            if self._thread is not None:
+                return
+            self._thread = threading.Thread(target=self._worker_loop, name="openwave-mixer", daemon=True)
+            self._thread.start()
+
+    def stop(self):
+        with self._lock:
+            self._closed = True
+            thread = self._thread
+        self._stopping.set()
+        self._wake.set()
+        if thread is not None and thread is not threading.current_thread():
+            # Every command is bounded. Never tear down while the worker can
+            # still spawn or mutate resources, even if a command is slow.
+            thread.join()
+        atexit.unregister(self.stop)
+
+    def _worker_loop(self):
         try:
-            proc = subprocess.Popen(
-                [
-                    "pw-loopback",
-                    # media.name is set explicitly because pw-loopback
-                    # otherwise derives it from its own PID, and WirePlumber
-                    # keys restore-stream on it.
-                    "--capture-props="
-                    f"node.autoconnect=false node.name={capture_node_name} "
-                    f"media.name={capture_node_name} "
-                    "audio.channels=2 audio.position=[FL,FR]",
-                    "--playback-props="
-                    f"target.object={playback_target} node.name={node_name} "
-                    f"media.name={node_name} "
-                    "audio.channels=2 audio.position=[FL,FR]",
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                preexec_fn=_set_pdeathsig,
-            )
-        except (FileNotFoundError, OSError):
-            return
-        self._procs[key] = proc
-        self._link_capture(capture_source_name, capture_node_name)
+            while not self._stopping.is_set():
+                self._wake.clear()
+                try:
+                    graph = self._pw.snapshot()
+                    self._discover(graph)
+                    self._reconcile(graph)
+                    with self._lock:
+                        self._error = None
+                except Exception as exc:
+                    with self._lock:
+                        self._error = str(exc)
+                    _log.warning("Routing reconciliation failed: %s", exc)
+                self._wake.wait(self._poll_interval)
+        finally:
+            self._teardown()
+
+    def _discover(self, graph):
+        captures = sorted(item["name"] for item in graph["captures"] if any(token in item["name"] for token in CARD_NAME_TOKENS))
+        mic = captures[0] if captures else None
+        stem = mic.removeprefix("alsa_input.").rsplit(".", 1)[0] if mic else None
+        hp = next((name for name in sorted(graph["sinks"]) if stem and name.startswith("alsa_output." + stem + ".")), None)
+        if mic is None:
+            hp = next((name for name in sorted(graph["sinks"]) if any(token in name for token in CARD_NAME_TOKENS)), None)
+        with self._lock:
+            self._graph = graph
+            self.mic, self.hp = mic, hp
+
+    def _ensure_sink(self, name, description, graph):
+        if name in graph["sinks"]:
+            return True
+        handle = self._owned_sinks.get(name)
+        if handle is not None:
+            if any(str(module.get("index")) == str(handle[0]) and handle[1] in str(module.get("argument", "")) for module in graph["modules"]):
+                return False
+            del self._owned_sinks[name]
+        handle = self._pw.create_sink(name, description)
+        if handle is not None:
+            self._owned_sinks[name] = handle
+        return False
 
     @staticmethod
-    def _link_capture(source_node_name, capture_node_name, retries=20):
-        """Wire each output port of `source_node_name` to a corresponding
-        input port of `capture_node_name`. Mono → stereo duplicates."""
-        for _ in range(retries):
-            src_ports = _ports("-o", source_node_name)
-            dst_ports = _ports("-i", capture_node_name)
-            if src_ports and dst_ports:
-                break
-            time.sleep(0.05)
-        else:
-            return
-        for i, dst in enumerate(dst_ports):
-            src = src_ports[i % len(src_ports)]
-            try:
-                subprocess.run(
-                    ["pw-link", src, dst],
-                    capture_output=True, text=True, timeout=2,
-                )
-            except (FileNotFoundError, subprocess.SubprocessError):
-                return
+    def _ports(graph, name, direction):
+        node = graph["nodes"].get(name)
+        return sorted(graph["ports"].get((str(node["id"]), direction), []), key=lambda port: port["id"]) if node else []
 
-    def _destroy_loopback(self, key):
-        proc = self._procs.pop(key, None)
-        if proc is None:
-            return
-        try:
-            proc.terminate()
-        except (OSError, ProcessLookupError):
-            return
+    def _link_nodes(self, graph, source, target):
+        outputs = self._ports(graph, source, "out")
+        inputs = self._ports(graph, target, "in")
+        if not outputs or not inputs:
+            return False
+        complete = True
+        for index, dest in enumerate(inputs):
+            origin = next((port for port in outputs if port["channel"] and port["channel"] == dest["channel"]), outputs[index % len(outputs)])
+            edge = (origin["id"], dest["id"])
+            if edge not in graph["links"]:
+                if self._pw.link(*edge):
+                    graph["links"].add(edge)
+                else:
+                    complete = False
+        return complete
+
+    @staticmethod
+    def _reap(proc):
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                pass
         try:
             proc.wait(timeout=2)
         except subprocess.TimeoutExpired:
-            try:
-                proc.kill()
-                proc.wait(timeout=1)
-            except (OSError, ProcessLookupError, subprocess.TimeoutExpired):
-                pass
+            proc.kill()
+            proc.wait()
 
-    def _atexit_cleanup(self):
-        """Fast best-effort tear-down on interpreter exit. No locking, no waits."""
-        for proc in list(self._procs.values()):
-            try:
-                proc.terminate()
-            except (OSError, ProcessLookupError):
+    def _drop_route(self, key):
+        route = self._procs.pop(key, None)
+        if route is not None:
+            self._reap(route["proc"])
+
+    def _route(self, key, source, target, name, volume, muted, graph, *, publish=False, description=None):
+        spec = (source, target, publish, description)
+        route = self._procs.get(key)
+        if route is not None and (route["spec"] != spec or route["proc"].poll() is not None):
+            self._drop_route(key)
+            route = None
+        if route is None:
+            proc = self._pw.spawn_loopback(name, publish=publish, description=description)
+            if proc is None:
+                return False
+            self._procs[key] = {"proc": proc, "spec": spec, "name": name}
+            return False
+        node = graph["nodes"].get(name)
+        if node is None or not self._pw.set_level(node["id"], volume, muted):
+            return False
+        # Establish gain before audio can enter a newly created stream.
+        playback_ok = publish or self._link_nodes(graph, name, target)
+        capture_ok = self._link_nodes(graph, source, name + "_cap") if playback_ok else False
+        return playback_ok and capture_ok
+
+    def _reconcile(self, graph):
+        with self._lock:
+            records, mixes, state = copy.deepcopy((self._sources, self._mixes, self._state))
+        # Until the UI owns its mic row, retain the established built-in id.
+        if "mic" not in records and self.mic:
+            records["mic"] = {"id": "mic", "kind": "device", "node_name": self.mic, "name": "Microphone", "level": 1.0}
+        wanted_sinks = {mix["sink"] for mix in mixes.values()}
+        ready = {mid for mid, mix in mixes.items() if self._ensure_sink(mix["sink"], mix["description"], graph)}
+        claims = claim_streams(records, graph["streams"])
+        desired = set()
+        wanted_moves = {}
+        for sid, source in records.items():
+            if sources.kind(source) == sources.KIND_APP:
+                capture = source_sink_name(sid)
+                wanted_sinks.add(capture)
+                if not self._ensure_sink(capture, source["name"], graph):
+                    continue
+                for stream_id in claims[sid]:
+                    stream = graph["streams"][stream_id]
+                    wanted_moves[stream["serial"]] = capture
+                    if stream["sink"] != capture:
+                        if self._pw.move_stream(stream, capture):
+                            self._moved.setdefault(stream["serial"], stream["sink"])
+            else:
+                capture = source.get("node_name") or (self.mic if sid == "mic" else None)
+                if capture not in {item["name"] for item in graph["captures"]}:
+                    continue
+            for mid in ready:
+                cell = state.get(f"{sid}.{mid}", {})
+                volume = cell.get("volume", 0.0)
+                if volume <= 0:
+                    continue
+                key = ("cell", sid, mid)
+                desired.add(key)
+                name = f"openwave_loop_{len(sid)}_{sid}_{mid}"
+                self._route(key, capture, mixes[mid]["sink"], name, volume * source.get("level", 1.0),
+                            bool(cell.get("muted") or source.get("muted")), graph)
+        if "personal" in ready and self.hp:
+            key = ("output", "personal")
+            desired.add(key)
+            self._route(key, mixes["personal"]["sink"], self.hp, "openwave_loop_personal_to_hp", 1.0, False, graph)
+        for key in list(self._procs):
+            if key not in desired:
+                self._drop_route(key)
+        wanted_sinks.update(self._restore_streams(graph, wanted_moves))
+        for name, handle in list(self._owned_sinks.items()):
+            if name not in wanted_sinks and self._pw.destroy_sink(handle, graph):
+                del self._owned_sinks[name]
+
+    def _restore_streams(self, graph, wanted):
+        streams = {stream["serial"]: stream for stream in graph["streams"].values()}
+        retained = set()
+        for serial, original in list(self._moved.items()):
+            if serial in wanted:
                 continue
-        self._procs.clear()
-
-    # Below this, the slider snaps to 0 — sub-1% values keep the loopback alive
-    # at imperceptible-but-not-silent volume and confuse "I put it back to 0".
-    _ZERO_THRESHOLD = 0.01
-
-    # ----- public API (returns immediately; subprocess work runs on worker) -----
-    def start(self):
-        """Spawn always-on Personal→HP loopback, snapshot streams, restore cells."""
-        self._enqueue(("start",), self._do_start)
-
-    def stop(self):
-        """Stop the worker and tear down every loopback. Brief block expected."""
-        self._worker_running = False
-        self._wake.set()
-        try:
-            self._worker.join(timeout=3)
-        except RuntimeError:
-            pass
-        with self._lock:
-            for key in list(self._procs.keys()):
-                self._destroy_loopback(key)
-
-    def set_cell(self, source_id, mix_id, volume, muted):
-        """Persist state synchronously; reconcile the cell on the worker."""
-        volume = max(0.0, min(1.0, float(volume)))
-        if volume < self._ZERO_THRESHOLD:
-            volume = 0.0
-        with self._lock:
-            self._state[f"{source_id}.{mix_id}"] = {
-                "volume": volume, "muted": bool(muted),
-            }
-            self._save_state()
-        self._enqueue(
-            ("cell", source_id, mix_id),
-            lambda sid=source_id, mid=mix_id: self._reconcile_cell(sid, mid),
-        )
-
-    def set_sources(self, sources):
-        """Update the app-source configuration; reconcile on worker."""
-        with self._lock:
-            self._sources = dict(sources)
-        self._enqueue(("set_sources",), self._reconcile_all)
-
-    def remove_source(self, source_id):
-        """Forget persisted cells now; tear down loopbacks on worker."""
-        with self._lock:
-            prefix = f"{source_id}."
-            for cell_key in [k for k in self._state if k.startswith(prefix)]:
-                del self._state[cell_key]
-            self._save_state()
-            self._sources.pop(source_id, None)
-        self._enqueue(
-            ("remove", source_id),
-            lambda sid=source_id: self._do_remove_source(sid),
-        )
-
-    def poll_streams(self):
-        """Refresh the active-stream cache; reconcile on worker if anything moved.
-
-        Returns (added, removed) stream-id sets for the caller's bookkeeping."""
-        new = {s["id"]: s for s in list_audio_streams()}
-        with self._lock:
-            added = set(new) - set(self._streams)
-            removed = set(self._streams) - set(new)
-            self._streams = new
-        if added or removed:
-            self._enqueue(("poll",), self._reconcile_all)
-        return added, removed
-
-    # ----- worker-side implementations -----
-    def _do_start(self):
-        self._sweep_stale_loopbacks()
-        if self.hp:
-            self._spawn_loopback(
-                HP_LOOPBACK_KEY, PERSONAL_MIX_SINK, self.hp, HP_LOOPBACK_NODE,
-            )
-        with self._lock:
-            self._streams = {s["id"]: s for s in list_audio_streams()}
-        self._reconcile_all()
-
-    def _do_remove_source(self, source_id):
-        with self._lock:
-            keys = [
-                k for k in self._procs
-                if isinstance(k, tuple) and k and k[0] == source_id
-            ]
-        for k in keys:
-            self._destroy_loopback(k)
-
-    @staticmethod
-    def _sweep_stale_loopbacks():
-        try:
-            subprocess.run(
-                ["pkill", "-f", "pw-loopback.*openwave_loop_"],
-                capture_output=True, timeout=2,
-            )
-        except (FileNotFoundError, subprocess.SubprocessError):
-            return
-        time.sleep(0.2)  # give the kernel a beat to reap so we don't race
-
-    # ----- internal -----
-    def _reconcile_all(self):
-        for source_id in (["mic"] + list(self._sources.keys())):
-            for mix_id in MIX_SINKS:
-                self._reconcile_cell(source_id, mix_id)
-
-    def _reconcile_cell(self, source_id, mix_id):
-        state = self._state.get(
-            f"{source_id}.{mix_id}", {"volume": 0.0, "muted": False}
-        )
-        if source_id == "mic":
-            self._reconcile_mic_cell(mix_id, state["volume"], state["muted"])
-        else:
-            self._reconcile_app_cell(source_id, mix_id, state["volume"], state["muted"])
-
-    def _reconcile_mic_cell(self, mix_id, volume, muted):
-        if not self.mic:
-            return
-        mix_sink = MIX_SINKS.get(mix_id)
-        if not mix_sink:
-            return
-        key = ("mic", mix_id)
-        node_name = f"openwave_loop_mic_to_{mix_id}"
-        if volume <= 0.0:
-            self._destroy_loopback(key)
-            return
-        if key not in self._procs:
-            self._spawn_loopback(key, self.mic, mix_sink, node_name)
-        node_id = _node_id_by_name(node_name)
-        if node_id is not None:
-            _wpctl("set-volume", node_id, f"{volume:.3f}")
-            _wpctl("set-mute", node_id, "1" if muted else "0")
-
-    def _reconcile_app_cell(self, source_id, mix_id, volume, muted):
-        source = self._sources.get(source_id)
-        if not source:
-            return
-        mix_sink = MIX_SINKS.get(mix_id)
-        if not mix_sink:
-            return
-        match = source.get("match_app_name")
-        matching_stream_ids = {
-            sid for sid, s in self._streams.items() if s.get("app_name") == match
-        }
-        existing_keys = {
-            k for k in self._procs
-            if len(k) == 3 and k[0] == source_id and k[1] == mix_id
-        }
-
-        # Tear down loopbacks for streams that vanished or for a zeroed cell
-        for k in list(existing_keys):
-            if volume <= 0.0 or k[2] not in matching_stream_ids:
-                self._destroy_loopback(k)
-
-        if volume <= 0.0:
-            return
-
-        # Spawn (or update volume on) loopbacks for each currently-matching stream
-        for stream_id in matching_stream_ids:
-            key = (source_id, mix_id, stream_id)
-            node_name = f"openwave_loop_{source_id}_{mix_id}_{stream_id}"
-            stream_node_name = self._streams.get(stream_id, {}).get("node_name", "")
-            if not stream_node_name:
+            stream = streams.get(serial)
+            if stream is None or not str(stream.get("sink", "")).startswith("openwave_src_"):
+                del self._moved[serial]
                 continue
-            if key not in self._procs:
-                self._spawn_loopback(key, stream_node_name, mix_sink, node_name)
-            node_id = _node_id_by_name(node_name)
-            if node_id is not None:
-                _wpctl("set-volume", node_id, f"{volume:.3f}")
-                _wpctl("set-mute", node_id, "1" if muted else "0")
+            target = original if original in graph["sinks"] else graph["default"]
+            if target in graph["sinks"] and not target.startswith("openwave_src_") and self._pw.move_stream(stream, target):
+                del self._moved[serial]
+            else:
+                retained.add(stream["sink"])
+        return retained
+
+    def _teardown(self):
+        for key in list(self._procs):
+            self._drop_route(key)
+        try:
+            for _ in range(3):
+                graph = self._pw.snapshot()
+                retained = self._restore_streams(graph, {})
+                if not retained:
+                    break
+            for name, handle in list(self._owned_sinks.items()):
+                if name not in retained and self._pw.destroy_sink(handle, graph):
+                    del self._owned_sinks[name]
+        except GraphError as exc:
+            # No current ownership evidence means no deletion, especially after
+            # a server restart. Never kill unrelated processes to compensate.
+            _log.warning("Could not remove owned virtual sinks: %s", exc)
