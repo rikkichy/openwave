@@ -359,7 +359,10 @@ class Mixer:
 
     def set_capture_mute(self, node_name, muted):
         with self._lock:
-            self._capture_requests[node_name] = bool(muted)
+            binding = self._capture_binding(node_name)
+            if binding is None:
+                return
+            self._capture_requests[node_name] = (binding, bool(muted))
         self._wake.set()
 
     def capture_device_present(self, node_name):
@@ -449,6 +452,7 @@ class Mixer:
         normalized = sources.normalize(records)
         with self._lock:
             self._sources = normalized
+            self._prune_capture_requests()
         self._wake.set()
 
     def set_source_level(self, source_id, volume, muted):
@@ -463,6 +467,7 @@ class Mixer:
             if sources.is_protected(self._sources.get(source_id, {})):
                 raise ValueError("Protected source cannot be removed")
             self._sources.pop(source_id, None)
+            self._prune_capture_requests()
             self._state = {key: value for key, value in self._state.items() if not key.startswith(source_id + ".")}
         self._persist()
         self._wake.set()
@@ -669,14 +674,29 @@ class Mixer:
             self._persist()
         return ready
 
+    def _capture_binding(self, name):
+        owners = frozenset(sid for sid, source in self._sources.items()
+                           if sources.kind(source) == sources.KIND_DEVICE and source.get("node_name") == name)
+        return owners or None
+
+    def _prune_capture_requests(self):
+        for name, (binding, _) in list(self._capture_requests.items()):
+            if self._capture_binding(name) != binding:
+                del self._capture_requests[name]
+
     def _sync_capture_mutes(self, graph):
         with self._lock:
+            self._prune_capture_requests()
             pending = dict(self._capture_requests)
         live = {item["name"] for item in graph["captures"]}
-        for name, muted in pending.items():
+        for name, request in pending.items():
+            binding, muted = request
+            with self._lock:
+                if self._capture_requests.get(name) != request or self._capture_binding(name) != binding:
+                    continue
             if name in live and self._pw.set_capture_mute(name, muted):
                 with self._lock:
-                    if self._capture_requests.get(name) == muted:
+                    if self._capture_requests.get(name) == request:
                         del self._capture_requests[name]
 
     def _reconcile(self, graph):

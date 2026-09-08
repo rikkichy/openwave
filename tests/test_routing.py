@@ -39,6 +39,7 @@ class PipeWire:
         self.fail_links = 0
         self.fail_moves = 0
         self.fail_levels = 0
+        self.fail_capture_mutes = 0
         self.operations = []
         self.sink("headphones")
         for mid in ("personal", "chat", "record"):
@@ -100,6 +101,20 @@ class PipeWire:
                 sink.update(volume=volume, muted=muted)
         return True
 
+    def capture(self, name):
+        ident = self.node(name)
+        self.graph["captures"] = [item for item in self.graph["captures"] if item["name"] != name]
+        self.graph["captures"].append({"name": name, "identity": (None, str(ident)),
+                                       "description": name, "priority": 0})
+        self.graph["capture_mutes"][name] = False
+
+    def set_capture_mute(self, name, muted):
+        if self.fail_capture_mutes:
+            self.fail_capture_mutes -= 1
+            return False
+        self.graph["capture_mutes"][name] = muted
+        return True
+
     def move_stream(self, stream, sink):
         if self.fail_moves:
             self.fail_moves -= 1
@@ -138,6 +153,12 @@ def eventually(predicate):
 
 
 class RoutingTests(unittest.TestCase):
+    @staticmethod
+    def reconcile(mixer, pw):
+        graph = pw.snapshot()
+        mixer._discover(graph)
+        mixer._reconcile(graph)
+
     def test_claims_are_exclusive_and_order_independent(self):
         streams = {7: {"app_name": " Music ", "binary": "/usr/bin/player"}}
         rows = {"z": {"match_app_names": ["Music"]}, "a": {"match_app_names": ["player"]},
@@ -209,6 +230,218 @@ class RoutingTests(unittest.TestCase):
                 mixer.stop()
             self.assertEqual(json.loads(path.read_text())["volumes"]["chat"], {"volume": 0.25, "muted": True})
 
+    def test_successful_master_change_preserves_publication_and_route_identity(self):
+        pw = PipeWire()
+        pw.stream()
+        with tempfile.TemporaryDirectory() as directory:
+            mixer = Mixer(pw, config_path=str(Path(directory) / "mixes.json"))
+            try:
+                mixer.set_sources({"music": {"name": "Music", "match_app_names": ["Music"]}})
+                mixer.set_cell("music", "personal", 0.6, False)
+                for _ in range(3):
+                    self.reconcile(mixer, pw)
+                self.assertTrue(pw.has_route("openwave_src_music", "openwave_personal_mix"))
+                self.assertTrue(pw.has_route("openwave_personal_mix", "headphones"))
+                self.assertIn(mix_capture_name("personal"), pw.graph["nodes"])
+                identities = {name: node["serial"] for name, node in pw.graph["nodes"].items()}
+
+                mixer.set_mix_volume("personal", 0.4, True)
+                for _ in range(2):
+                    self.reconcile(mixer, pw)
+                    self.assertEqual({name: node["serial"] for name, node in pw.graph["nodes"].items()},
+                                     identities)
+                    self.assertTrue(pw.has_route("openwave_src_music", "openwave_personal_mix"))
+                    self.assertTrue(pw.has_route("openwave_personal_mix", "headphones"))
+                self.assertEqual(pw.graph["sinks"]["openwave_personal_mix"]["volume"], 0.4)
+                self.assertTrue(pw.graph["sinks"]["openwave_personal_mix"]["muted"])
+            finally:
+                mixer._teardown()
+                mixer.stop()
+
+    def test_failed_restore_retains_intake_until_original_destination_recovers(self):
+        pw = PipeWire()
+        pw.sink("speakers")
+        stream = pw.stream()
+        pw.graph["streams"][stream]["sink"] = "speakers"
+        with tempfile.TemporaryDirectory() as directory:
+            mixer = Mixer(pw, config_path=str(Path(directory) / "mixes.json"))
+            try:
+                mixer.set_sources({"music": {"name": "Music", "match_app_names": ["Music"]}})
+                for _ in range(3):
+                    self.reconcile(mixer, pw)
+                self.assertEqual(pw.graph["streams"][stream]["sink"], "openwave_src_music")
+
+                mixer.remove_source("music")
+                pw.fail_moves = 1
+                self.reconcile(mixer, pw)
+                self.assertEqual(pw.graph["streams"][stream]["sink"], "openwave_src_music")
+                self.assertIn("openwave_src_music", pw.graph["sinks"])
+
+                self.reconcile(mixer, pw)
+                self.assertEqual(pw.graph["streams"][stream]["sink"], "speakers")
+                self.assertNotIn("openwave_src_music", pw.graph["sinks"])
+            finally:
+                mixer._teardown()
+                mixer.stop()
+
+    def test_teardown_retries_restore_and_retains_unresolved_intake(self):
+        for persistent_failure in (False, True):
+            with self.subTest(persistent_failure=persistent_failure), tempfile.TemporaryDirectory() as directory:
+                pw = PipeWire()
+                pw.sink("speakers")
+                stream = pw.stream()
+                pw.graph["streams"][stream]["sink"] = "speakers"
+                mixer = Mixer(pw, config_path=str(Path(directory) / "mixes.json"))
+                try:
+                    mixer.set_sources({"music": {"name": "Music", "match_app_names": ["Music"]}})
+                    for _ in range(3):
+                        self.reconcile(mixer, pw)
+                    self.assertEqual(pw.graph["streams"][stream]["sink"], "openwave_src_music")
+
+                    pw.fail_moves = 100 if persistent_failure else 1
+                    mixer._teardown()
+                    if persistent_failure:
+                        self.assertEqual(pw.graph["streams"][stream]["sink"], "openwave_src_music")
+                        self.assertIn("openwave_src_music", pw.graph["sinks"])
+                    else:
+                        self.assertEqual(pw.graph["streams"][stream]["sink"], "speakers")
+                        self.assertNotIn("openwave_src_music", pw.graph["sinks"])
+                finally:
+                    pw.fail_moves = 0
+                    mixer._teardown()
+                    mixer.stop()
+
+    def test_offline_configured_capture_queues_mute_until_connected(self):
+        pw = PipeWire()
+        with tempfile.TemporaryDirectory() as directory:
+            mixer = Mixer(pw, config_path=str(Path(directory) / "mixes.json"))
+            try:
+                mixer.set_sources({"mic": {"kind": "device", "node_name": "microphone"}})
+                mixer.set_capture_mute("microphone", True)
+                self.reconcile(mixer, pw)
+                self.assertEqual(pw.graph["capture_mutes"], {})
+
+                pw.capture("microphone")
+                self.reconcile(mixer, pw)
+                self.assertTrue(pw.graph["capture_mutes"]["microphone"])
+            finally:
+                mixer._teardown()
+                mixer.stop()
+
+    def test_capture_mute_rejects_unowned_capture_before_later_binding(self):
+        pw = PipeWire()
+        pw.capture("microphone")
+        with tempfile.TemporaryDirectory() as directory:
+            mixer = Mixer(pw, config_path=str(Path(directory) / "mixes.json"))
+            try:
+                self.reconcile(mixer, pw)
+                mixer.set_capture_mute("microphone", True)
+                mixer.set_sources({"mic": {"kind": "device", "node_name": "microphone"}})
+                self.reconcile(mixer, pw)
+                self.assertFalse(pw.graph["capture_mutes"]["microphone"])
+
+                mixer.set_capture_mute("microphone", True)
+                self.reconcile(mixer, pw)
+                self.assertTrue(pw.graph["capture_mutes"]["microphone"])
+            finally:
+                mixer._teardown()
+                mixer.stop()
+
+    def test_removed_source_drops_capture_mute_before_same_binding_returns(self):
+        pw = PipeWire()
+        pw.capture("microphone")
+        records = {"mic": {"kind": "device", "node_name": "microphone"}}
+        with tempfile.TemporaryDirectory() as directory:
+            mixer = Mixer(pw, config_path=str(Path(directory) / "mixes.json"))
+            try:
+                mixer.set_sources(records)
+                self.reconcile(mixer, pw)
+                mixer.set_capture_mute("microphone", True)
+                pw.fail_capture_mutes = 1
+                self.reconcile(mixer, pw)
+                self.assertFalse(pw.graph["capture_mutes"]["microphone"])
+
+                mixer.remove_source("mic")
+                mixer.set_sources(records)
+                self.reconcile(mixer, pw)
+                self.assertFalse(pw.graph["capture_mutes"]["microphone"])
+            finally:
+                mixer._teardown()
+                mixer.stop()
+
+    def test_capture_mute_dispatch_rechecks_ownership_after_earlier_command(self):
+        class RemovingCapture(PipeWire):
+            def set_capture_mute(self, name, muted):
+                applied = super().set_capture_mute(name, muted)
+                mixer.remove_source("other")
+                return applied
+
+        pw = RemovingCapture()
+        pw.capture("microphone")
+        pw.capture("other_microphone")
+        with tempfile.TemporaryDirectory() as directory:
+            mixer = Mixer(pw, config_path=str(Path(directory) / "mixes.json"))
+            try:
+                mixer.set_sources({"mic": {"kind": "device", "node_name": "microphone"},
+                                   "other": {"kind": "device", "node_name": "other_microphone"}})
+                self.reconcile(mixer, pw)
+                mixer.set_capture_mute("microphone", True)
+                mixer.set_capture_mute("other_microphone", True)
+                self.reconcile(mixer, pw)
+                self.assertTrue(pw.graph["capture_mutes"]["microphone"])
+                self.assertFalse(pw.graph["capture_mutes"]["other_microphone"])
+            finally:
+                mixer._teardown()
+                mixer.stop()
+
+    def test_rebound_source_drops_capture_mute_before_old_binding_returns(self):
+        pw = PipeWire()
+        pw.capture("microphone")
+        pw.capture("other_microphone")
+        records = {"mic": {"kind": "device", "node_name": "microphone"}}
+        with tempfile.TemporaryDirectory() as directory:
+            mixer = Mixer(pw, config_path=str(Path(directory) / "mixes.json"))
+            try:
+                mixer.set_sources(records)
+                self.reconcile(mixer, pw)
+                mixer.set_capture_mute("microphone", True)
+                pw.fail_capture_mutes = 1
+                self.reconcile(mixer, pw)
+
+                mixer.set_sources({"mic": {"kind": "device", "node_name": "other_microphone"}})
+                mixer.set_sources(records)
+                self.reconcile(mixer, pw)
+                self.assertFalse(pw.graph["capture_mutes"]["microphone"])
+                self.assertFalse(pw.graph["capture_mutes"]["other_microphone"])
+            finally:
+                mixer._teardown()
+                mixer.stop()
+
+    def test_owned_capture_retains_pending_mute_across_reconnect(self):
+        for observe_unplug in (True, False):
+            with self.subTest(observe_unplug=observe_unplug), tempfile.TemporaryDirectory() as directory:
+                pw = PipeWire()
+                pw.capture("microphone")
+                mixer = Mixer(pw, config_path=str(Path(directory) / "mixes.json"))
+                try:
+                    mixer.set_sources({"mic": {"kind": "device", "node_name": "microphone"}})
+                    self.reconcile(mixer, pw)
+                    mixer.set_capture_mute("microphone", True)
+                    pw.fail_capture_mutes = 1
+                    self.reconcile(mixer, pw)
+
+                    if observe_unplug:
+                        pw.graph["captures"].clear()
+                        pw.graph["nodes"].pop("microphone")
+                        pw.graph["capture_mutes"].pop("microphone")
+                        self.reconcile(mixer, pw)
+                    pw.capture("microphone")
+                    self.reconcile(mixer, pw)
+                    self.assertTrue(pw.graph["capture_mutes"]["microphone"])
+                finally:
+                    mixer._teardown()
+                    mixer.stop()
+
     def test_dynamic_outputs_publish_capture_and_stop_owned_children(self):
         pw = PipeWire()
         with tempfile.TemporaryDirectory() as directory:
@@ -274,90 +507,3 @@ class RoutingTests(unittest.TestCase):
         graph = DuplicateStreams().snapshot()
         self.assertEqual(claim_streams({"player": {"match_app_names": ["Player"]}}, graph["streams"]),
                          {"player": {11, 12}})
-
-    @staticmethod
-    def reconcile(mixer, pw):
-        graph = pw.snapshot()
-        mixer._discover(graph)
-        mixer._reconcile(graph)
-
-    def test_failed_restore_retains_intake_until_original_destination_recovers(self):
-        pw = PipeWire()
-        pw.sink("speakers")
-        stream = pw.stream()
-        pw.graph["streams"][stream]["sink"] = "speakers"
-        with tempfile.TemporaryDirectory() as directory:
-            mixer = Mixer(pw, config_path=str(Path(directory) / "mixes.json"))
-            try:
-                mixer.set_sources({"music": {"name": "Music", "match_app_names": ["Music"]}})
-                for _ in range(3):
-                    self.reconcile(mixer, pw)
-                self.assertEqual(pw.graph["streams"][stream]["sink"], "openwave_src_music")
-
-                mixer.remove_source("music")
-                pw.fail_moves = 1
-                self.reconcile(mixer, pw)
-                self.assertEqual(pw.graph["streams"][stream]["sink"], "openwave_src_music")
-                self.assertIn("openwave_src_music", pw.graph["sinks"])
-
-                self.reconcile(mixer, pw)
-                self.assertEqual(pw.graph["streams"][stream]["sink"], "speakers")
-                self.assertNotIn("openwave_src_music", pw.graph["sinks"])
-            finally:
-                mixer._teardown()
-                mixer.stop()
-
-    def test_teardown_retries_restore_and_retains_unresolved_intake(self):
-        for persistent_failure in (False, True):
-            with self.subTest(persistent_failure=persistent_failure), tempfile.TemporaryDirectory() as directory:
-                pw = PipeWire()
-                pw.sink("speakers")
-                stream = pw.stream()
-                pw.graph["streams"][stream]["sink"] = "speakers"
-                mixer = Mixer(pw, config_path=str(Path(directory) / "mixes.json"))
-                try:
-                    mixer.set_sources({"music": {"name": "Music", "match_app_names": ["Music"]}})
-                    for _ in range(3):
-                        self.reconcile(mixer, pw)
-                    self.assertEqual(pw.graph["streams"][stream]["sink"], "openwave_src_music")
-
-                    pw.fail_moves = 100 if persistent_failure else 1
-                    mixer._teardown()
-                    if persistent_failure:
-                        self.assertEqual(pw.graph["streams"][stream]["sink"], "openwave_src_music")
-                        self.assertIn("openwave_src_music", pw.graph["sinks"])
-                    else:
-                        self.assertEqual(pw.graph["streams"][stream]["sink"], "speakers")
-                        self.assertNotIn("openwave_src_music", pw.graph["sinks"])
-                finally:
-                    pw.fail_moves = 0
-                    mixer._teardown()
-                    mixer.stop()
-
-    def test_successful_master_change_preserves_publication_and_route_identity(self):
-        pw = PipeWire()
-        pw.stream()
-        with tempfile.TemporaryDirectory() as directory:
-            mixer = Mixer(pw, config_path=str(Path(directory) / "mixes.json"))
-            try:
-                mixer.set_sources({"music": {"name": "Music", "match_app_names": ["Music"]}})
-                mixer.set_cell("music", "personal", 0.6, False)
-                for _ in range(3):
-                    self.reconcile(mixer, pw)
-                self.assertTrue(pw.has_route("openwave_src_music", "openwave_personal_mix"))
-                self.assertTrue(pw.has_route("openwave_personal_mix", "headphones"))
-                self.assertIn(mix_capture_name("personal"), pw.graph["nodes"])
-                identities = {name: node["serial"] for name, node in pw.graph["nodes"].items()}
-
-                mixer.set_mix_volume("personal", 0.4, True)
-                for _ in range(2):
-                    self.reconcile(mixer, pw)
-                    self.assertEqual({name: node["serial"] for name, node in pw.graph["nodes"].items()},
-                                     identities)
-                    self.assertTrue(pw.has_route("openwave_src_music", "openwave_personal_mix"))
-                    self.assertTrue(pw.has_route("openwave_personal_mix", "headphones"))
-                self.assertEqual(pw.graph["sinks"]["openwave_personal_mix"]["volume"], 0.4)
-                self.assertTrue(pw.graph["sinks"]["openwave_personal_mix"]["muted"])
-            finally:
-                mixer._teardown()
-                mixer.stop()
