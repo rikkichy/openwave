@@ -4,6 +4,7 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_call:
 
 permissions:
   contents: read
@@ -25,3 +26,18 @@ jobs:
         run: python -m unittest discover -s tests -t .
       - name: Compile Python sources
         run: python -m compileall -q wavexlr tests
+
+  installed:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GTK and package smoke dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 adwaita-icon-theme libusb-1.0-0 xvfb xauth dbus-x11 desktop-file-utils
+      - name: Stage complete package
+        run: make install DESTDIR="$RUNNER_TEMP/openwave-stage" PREFIX=/usr PYTHON=/usr/bin/python3
+      - name: Exercise installed entry points and GTK imports
+        run: PYTHON=/usr/bin/python3 dbus-run-session -- xvfb-run -a sh packaging/smoke-install.sh "$RUNNER_TEMP/openwave-stage/usr"
+      - name: Validate desktop entry
+        run: desktop-file-validate "$RUNNER_TEMP/openwave-stage/usr/share/applications/openwave.desktop"

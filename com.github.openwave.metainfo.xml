@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.github.openwave</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>OpenWave</name>
+  <summary>Control Elgato Wave hardware and route application audio</summary>
+  <description>
+    <p>OpenWave is a GTK4 and libadwaita control panel for Elgato Wave audio
+    hardware on Linux, with a PipeWire mixing matrix for application and
+    device sources. Route sources to independent mixes and output devices.</p>
+    <p>Native installations support user-managed hardware permissions and
+    background services. The experimental Flatpak supplies the panel and
+    routing tools only; host hardware permissions and services must be
+    configured outside the sandbox.</p>
+  </description>
+  <launchable type="desktop-id">openwave.desktop</launchable>
+  <url type="homepage">https://github.com/rikkichy/openwave</url>
+  <url type="bugtracker">https://github.com/rikkichy/openwave/issues</url>
+  <categories>
+    <category>AudioVideo</category>
+    <category>Audio</category>
+    <category>Mixer</category>
+  </categories>
+  <developer id="io.github.rikkichy">
+    <name>rikkichy and OpenWave contributors</name>
+  </developer>
+  <recommends>
+    <control>pointing</control>
+    <control>keyboard</control>
+  </recommends>
+  <supports>
+    <modalias>usb:v0FD9p007D*</modalias>
+    <modalias>usb:v0FD9p00A6*</modalias>
+    <modalias>usb:v0FD9p0070*</modalias>
+  </supports>
+  <content_rating type="oars-1.1"/>
+</component>

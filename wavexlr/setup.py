@@ -135,14 +135,6 @@ cat > {UDEV_PATH} <<'EOF'
 EOF
 udevadm control --reload-rules
 {trigger_lines}
-# Also chmod the device node directly so no replug is needed
-for dev in /dev/bus/usb/*/; do
-    for f in "$dev"*; do
-        if udevadm info --query=property "$f" 2>/dev/null | grep -q 'ID_VENDOR_ID=0fd9'; then
-            chmod 0666 "$f"
-        fi
-    done
-done
 """
     tmp = "/tmp/openwave-udev-setup.sh"
     with open(tmp, "w") as f:

@@ -10,7 +10,7 @@ import types
 import unittest
 from unittest import mock
 
-from wavexlr import daemon, diag
+from wavexlr import daemon, diag, mixer, mixes, scenes, sources
 
 
 class Privacy(unittest.TestCase):
@@ -76,7 +76,13 @@ class Privacy(unittest.TestCase):
             path = os.path.join(directory, "sources.json")
             with open(path, "w") as stream:
                 json.dump({"private": "SECRET_APP_NAME"}, stream)
-            with mock.patch.object(diag.os.path, "expanduser", return_value=path):
+            with contextlib.ExitStack() as stack:
+                for module, filename in (
+                    (sources, "sources.json"), (mixes, "mixdefs.json"),
+                    (mixer, "mixes.json"), (scenes, "scenes.json"),
+                ):
+                    stack.enter_context(mock.patch.object(
+                        module, "CONFIG_PATH", os.path.join(directory, filename)))
                 self.assertNotIn("SECRET_APP_NAME", diag.collect_configs())
                 self.assertIn("SECRET_APP_NAME", diag.collect_configs(full=True))
 

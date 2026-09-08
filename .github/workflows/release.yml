@@ -1,0 +1,118 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    uses: ./.github/workflows/tests.yml
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install native build and GTK smoke dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rpm python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 adwaita-icon-theme libusb-1.0-0 xvfb xauth dbus-x11
+      - name: Build one version from one source archive
+        env:
+          RELEASE_REF: ${{ github.ref }}
+        run: |
+          if [[ "$RELEASE_REF" == refs/tags/* ]]; then
+            bash packaging/build-release.sh "${RELEASE_REF#refs/tags/}"
+          else
+            bash packaging/build-release.sh
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-objects
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && github.repository == 'rikkichy/openwave'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-objects
+      - name: Verify and attach every native artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          sha256sum --check sha256sums.txt
+          gh release create "$RELEASE_TAG" --verify-tag \
+            --repo rikkichy/openwave --title "OpenWave ${RELEASE_TAG#v}" \
+            --generate-notes openwave-*.tar.gz openwave_*.deb openwave-*.rpm PKGBUILD sha256sums.txt
+
+  aur:
+    needs: publish
+    if: vars.AUR_PUBLISH == 'true' && github.repository == 'rikkichy/openwave'
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    environment: aur
+    timeout-minutes: 10
+    steps:
+      - name: Install AUR tools
+        run: pacman -Syu --noconfirm git openssh
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-objects
+      - name: Publish verified recipe to AUR only
+        shell: bash
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          # One reviewed Ed25519 known_hosts entry, also checked against the
+          # fingerprint published at https://aur.archlinux.org/ (2026-09-08).
+          AUR_KNOWN_HOSTS: ${{ secrets.AUR_KNOWN_HOSTS }}
+          AUR_USERNAME: ${{ secrets.AUR_USERNAME }}
+          AUR_EMAIL: ${{ secrets.AUR_EMAIL }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          : "${AUR_SSH_PRIVATE_KEY:?AUR private key is required}"
+          : "${AUR_KNOWN_HOSTS:?Reviewed official known_hosts is required}"
+          : "${AUR_USERNAME:?AUR commit identity is required}"
+          : "${AUR_EMAIL:?AUR commit email is required}"
+          sha256sum --check sha256sums.txt
+          SSH_DIR=$(mktemp -d)
+          trap 'rm -rf "$SSH_DIR"' EXIT
+          chmod 700 "$SSH_DIR"
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > "$SSH_DIR/key"
+          printf '%s\n' "$AUR_KNOWN_HOSTS" > "$SSH_DIR/known_hosts"
+          chmod 600 "$SSH_DIR/key" "$SSH_DIR/known_hosts"
+          ssh-keygen -F aur.archlinux.org -f "$SSH_DIR/known_hosts" >/dev/null
+          fingerprint=$(ssh-keygen -lf "$SSH_DIR/known_hosts" -E sha256 | cut -d ' ' -f 2)
+          [[ "$fingerprint" == 'SHA256:RFzBCUItH9LZS0cKB5UE6ceAYhBD5C8GeOBip8Z11+4' ]]
+          export GIT_SSH_COMMAND="ssh -F /dev/null -i $SSH_DIR/key -o IdentitiesOnly=yes -o BatchMode=yes -o HostKeyAlgorithms=ssh-ed25519 -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$SSH_DIR/known_hosts -o GlobalKnownHostsFile=/dev/null"
+          git clone ssh://aur@aur.archlinux.org/openwave.git aur-repo
+          cp PKGBUILD aur-repo/PKGBUILD
+          useradd -m builder
+          chown -R builder:builder aur-repo
+          RECIPE_DIR=$(realpath aur-repo)
+          (cd aur-repo && runuser -u builder -- makepkg --printsrcinfo) > aur-repo/.SRCINFO
+          git -C aur-repo -c safe.directory="$RECIPE_DIR" config user.name "$AUR_USERNAME"
+          git -C aur-repo -c safe.directory="$RECIPE_DIR" config user.email "$AUR_EMAIL"
+          git -C aur-repo -c safe.directory="$RECIPE_DIR" add PKGBUILD .SRCINFO
+          if ! git -C aur-repo -c safe.directory="$RECIPE_DIR" diff --cached --quiet; then
+            git -C aur-repo -c safe.directory="$RECIPE_DIR" commit -m "Update to $RELEASE_TAG"
+            git -C aur-repo -c safe.directory="$RECIPE_DIR" push origin HEAD:master
+          fi

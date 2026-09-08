@@ -1,0 +1,200 @@
+# Experimental panel + routing package, adapted from PR #8 (see attribution).
+# Build: flatpak-builder --user --install --force-clean build-flatpak packaging/flatpak/com.github.openwave.yml
+# Requires org.gnome.Platform//49 and org.gnome.Sdk//49.
+# Host udev permissions and native services MUST be configured outside this
+# sandbox. This manifest neither installs nor restarts host audio services.
+app-id: com.github.openwave
+runtime: org.gnome.Platform
+runtime-version: "49"
+sdk: org.gnome.Sdk
+command: openwave
+rename-desktop-file: openwave.desktop
+rename-icon: openwave
+copy-icon: true
+finish-args:
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=all
+  - --filesystem=xdg-run/pipewire-0
+  - --socket=pulseaudio
+  - --talk-name=org.kde.StatusNotifierWatcher
+  - --env=LADSPA_PATH=/app/lib/ladspa
+
+modules:
+  # GTK4, libadwaita, Python/PyGObject, expat, ncurses and libxml2 are supplied
+  # by the GNOME runtime/SDK. Raw USB and all audio CLI tools are explicit.
+  - name: libusb
+    config-opts: [--disable-udev]
+    sources:
+      - type: git
+        url: https://github.com/libusb/libusb.git
+        tag: v1.0.29
+        commit: 15a7ebb4d426c5ce196684347d2b7cafad862626
+      - type: shell
+        commands: [autoreconf -fiv]
+
+  - name: alsa-lib
+    sources:
+      - type: git
+        url: https://github.com/alsa-project/alsa-lib.git
+        tag: v1.2.13
+        commit: 785fd327ada6fc1778a2bb21176cb66705eb6b33
+      - type: shell
+        commands: [autoreconf -fiv]
+
+  - name: alsa-utils
+    config-opts:
+      - --disable-alsamixer
+      - --disable-xmlto
+      - --disable-nls
+      - --with-udev-rules-dir=/app/lib/udev/rules.d
+    sources:
+      - type: git
+        url: https://github.com/alsa-project/alsa-utils.git
+        tag: v1.2.13
+        commit: f04b9e0f1285fe25d4146906c5a8511741b8abad
+      - type: shell
+        commands: [autoreconf -fiv]
+
+  # Required by pw-cat and the PulseAudio client tools, even without a daemon.
+  - name: libsndfile
+    buildsystem: cmake-ninja
+    config-opts:
+      - -DBUILD_SHARED_LIBS=ON
+      - -DBUILD_PROGRAMS=OFF
+      - -DBUILD_EXAMPLES=OFF
+      - -DBUILD_TESTING=OFF
+      - -DENABLE_EXTERNAL_LIBS=OFF
+      - -DENABLE_MPEG=OFF
+      - -DINSTALL_PKGCONFIG_MODULE=ON
+    sources:
+      - type: archive
+        url: https://deb.debian.org/debian/pool/main/libs/libsndfile/libsndfile_1.2.2.orig.tar.gz
+        sha256: ffe12ef8add3eaca876f04087734e6e8e029350082f3251f565fa9da55b52121
+
+  # pactl is NOT supplied by pipewire or wireplumber. Build client utilities
+  # without a PulseAudio server so they connect to the host's pulse socket.
+  - name: pulseaudio-client
+    buildsystem: meson
+    config-opts:
+      - -Ddaemon=false
+      - -Dclient=true
+      - -Dtests=false
+      - -Dman=false
+      - -Ddoxygen=false
+      - -Dgtk=disabled
+      - -Dsystemd=disabled
+      - -Dudev=disabled
+      - -Ddatabase=simple
+    sources:
+      - type: git
+        url: https://gitlab.freedesktop.org/pulseaudio/pulseaudio.git
+        tag: v17.0
+        commit: 1f020889c9aa44ea0f63d7222e8c2b62c3f45f68
+
+  - name: pipewire-tools
+    buildsystem: meson
+    config-opts:
+      - -Dsession-managers=[]
+      - -Dexamples=disabled
+      - -Dtests=disabled
+      - -Dgstreamer=disabled
+      - -Dsystemd=disabled
+      - -Dpipewire-alsa=disabled
+      - -Dpipewire-jack=disabled
+      - -Dpipewire-v4l2=disabled
+      - -Dpw-cat=enabled
+      - -Dsndfile=enabled
+      - -Dudevrulesdir=/app/lib/udev/rules.d
+    sources:
+      - type: git
+        url: https://gitlab.freedesktop.org/pipewire/pipewire.git
+        tag: "1.4.2"
+        commit: d20a1523b6770dfa93a270bdda5d7c800d7ec191
+    post-install:
+      - test -x /app/bin/pw-top
+
+  - name: lua
+    buildsystem: simple
+    build-commands:
+      - make -C src all CC=cc MYCFLAGS="-fPIC -DLUA_USE_LINUX" MYLIBS="-ldl"
+      - make install INSTALL_TOP=/app
+      - |
+        mkdir -p /app/lib/pkgconfig
+        cat > /app/lib/pkgconfig/lua.pc <<'EOF'
+        prefix=/app
+        libdir=${prefix}/lib
+        includedir=${prefix}/include
+        Name: Lua
+        Description: Lua language engine
+        Version: 5.4.8
+        Libs: -L${libdir} -llua -lm -ldl
+        Cflags: -I${includedir}
+        EOF
+    sources:
+      - type: archive
+        url: https://www.lua.org/ftp/lua-5.4.8.tar.gz
+        sha256: 4f18ddae154e793e46eeab727c59ef1c0c0c2b744e7b94219710d76f530629ae
+
+  - name: wireplumber
+    buildsystem: meson
+    config-opts:
+      - -Dsystemd=disabled
+      - -Delogind=disabled
+      - -Ddoc=disabled
+      - -Dintrospection=disabled
+      - -Dtests=false
+      - -Ddaemon=false
+      - -Dsystem-lua=true
+    sources:
+      - type: git
+        url: https://gitlab.freedesktop.org/pipewire/wireplumber.git
+        tag: "0.5.10"
+        commit: 7a4d3177550b6b53fe0a49396da5b07f5353daff
+
+  - name: fftw-single
+    config-opts: [--enable-float, --enable-shared, --disable-static, --disable-fortran]
+    sources:
+      - type: archive
+        url: https://www.fftw.org/fftw-3.3.10.tar.gz
+        sha256: 56c932549852cddcfafdab3820b0200c7742675be92179e59e6215b340e26467
+
+  # Build-time parser for SWH's local XML plugin definitions; no network used.
+  - name: perl-xml-parser
+    buildsystem: simple
+    build-commands:
+      - perl Makefile.PL INSTALL_BASE=/app
+      - make
+      - make install
+    sources:
+      - type: archive
+        url: https://cpan.metacpan.org/authors/id/T/TO/TODDR/XML-Parser-2.47.tar.gz
+        sha256: ad4aae643ec784f489b956abe952432871a622d4e2b5c619e8855accbfc4d1d8
+
+  - name: swh-plugins
+    build-options:
+      env:
+        PERL5LIB: /app/lib/perl5
+    config-opts: [--disable-static, --disable-nls]
+    sources:
+      - type: archive
+        url: https://deb.debian.org/debian/pool/main/s/swh-plugins/swh-plugins_0.4.17.orig.tar.gz
+        sha256: bac6ca70cce3cadaae152015b56c651b5f758c3df5f0fba1d492874ff9c6aa34
+      - type: shell
+        commands: [autoreconf -fiv]
+
+  - name: openwave
+    buildsystem: simple
+    build-commands:
+      - make install PREFIX=/app PYTHON=python3 SITEPKG=/app/share/openwave/site-packages
+      - /app/bin/openwave --version
+      - /app/bin/openwave-daemon --help
+      - /app/bin/openwave-diag --help
+      - /app/bin/openwave-diag --version
+      - /app/bin/openwave-probe --help
+      - test -x /app/bin/pactl && test -x /app/bin/wpctl && test -x /app/bin/pw-top && test -x /app/bin/pw-cat
+      - test -f /app/lib/ladspa/gate_1410.so && test -f /app/lib/ladspa/sc4m_1916.so
+    sources:
+      - type: dir
+        path: ../..
