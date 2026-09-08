@@ -44,6 +44,20 @@ class StoreTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             mixes.normalize({"a": {"sink": "openwave_shared"}, "b": {"sink": "openwave_shared"}})
 
+    def test_joined_group_is_exclusive_after_reload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(sources, "CONFIG_PATH", str(Path(directory) / "sources.json")):
+                records = sources.normalize({"voice": {"group": "Live"}})
+                sources.add(records, {"id": "backup", "group": "Live"})
+                reloaded = sources.load()
+                self.assertFalse(reloaded["voice"]["muted"])
+                self.assertTrue(reloaded["backup"]["muted"])
+                sources.update(reloaded, "voice", muted=True)
+                sources.update(reloaded, "backup", muted=False)
+                recalled = sources.load()
+                self.assertTrue(recalled["voice"]["muted"])
+                self.assertFalse(recalled["backup"]["muted"])
+
     def test_mix_rename_preserves_external_sink_and_cell_identity(self):
         with tempfile.TemporaryDirectory() as directory:
             with patch.object(mixes, "CONFIG_PATH", str(Path(directory) / "mixdefs.json")):

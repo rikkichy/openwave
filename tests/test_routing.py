@@ -179,7 +179,7 @@ class RoutingTests(unittest.TestCase):
                 cell["volume"] = 0
                 self.assertEqual(mixer.get_cell("music", "chat")["volume"], 0.5)
                 self.assertEqual(mixer.streams(), {})
-                mixer.poll_streams()
+                mixer.request_stream_poll()
             finally:
                 mixer.stop()
 
@@ -235,9 +235,24 @@ class RoutingTests(unittest.TestCase):
     def test_reused_module_id_does_not_authorize_deletion(self):
         from unittest.mock import patch
         pw = SubprocessPipeWire()
-        graph = {"modules": [{"index": 8, "argument": "openwave.owner=someone-else"}]}
+        graph = {"nodes": {"unrelated": {"props": {
+            "pulse.module.id": 8, "openwave.owner": "someone-else",
+        }}}}
         with patch("wavexlr.mixer.subprocess.run", side_effect=AssertionError("Unrelated resource touched")):
             self.assertTrue(pw.destroy_sink((8, "our-token"), graph))
+
+    def test_owned_sink_removal_uses_native_module_identity(self):
+        from unittest.mock import patch
+        pw = SubprocessPipeWire()
+        nodes = {"owned": {"props": {"pulse.module.id": 8, "openwave.owner": "our-token"}}}
+        def unload(argv, **kwargs):
+            if argv == ["pactl", "unload-module", "8"]:
+                nodes.pop("owned")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        # pactl's JSON module list does not expose module indices.
+        with patch("wavexlr.mixer.subprocess.run", side_effect=unload):
+            pw.destroy_sink((8, "our-token"), {"nodes": nodes, "modules": []})
+        self.assertFalse(nodes)
 
     def test_duplicate_stream_names_remain_independently_claimable(self):
         objects = [{"id": index, "type": "PipeWire:Interface:Node",

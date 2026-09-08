@@ -8,16 +8,14 @@ determine whether links and levels need repair.
 
 import atexit
 import copy
-import ctypes
 import json
 import logging
 import os
-import signal
 import subprocess
 import threading
 import uuid
 
-from . import mixes as mix_store, sources
+from . import child, mixes as mix_store, sources
 
 _log = logging.getLogger(__name__)
 CONFIG_PATH = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "openwave", "mixes.json")
@@ -27,22 +25,24 @@ OUTPUT_AUTO = "auto"
 OUTPUT_NONE = "none"
 OUTPUTS_STATE_KEY = "outputs"
 VOLUMES_STATE_KEY = "volumes"
-try:
-    _libc = ctypes.CDLL(None, use_errno=True)
-except OSError:
-    _libc = None
-
-
-def _set_pdeathsig():
-    if _libc is not None:
-        _libc.prctl(1, int(signal.SIGTERM), 0, 0, 0)
-        if os.getppid() == 1:
-            os.kill(os.getpid(), signal.SIGTERM)
 
 
 def properties(values):
     """SPA property object; JSON quoting also escapes untrusted display labels."""
     return "{ " + " ".join(f"{key} = {json.dumps(value, ensure_ascii=True, allow_nan=False)}" for key, value in values.items()) + " }"
+
+def pulse_properties(values):
+    """Quote both Pulse argument layers; its parser is not a JSON decoder."""
+    def quote(text):
+        if "\0" in text:
+            raise ValueError("Audio properties cannot contain NUL")
+        return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+    pairs = []
+    for key, value in values.items():
+        text = value if isinstance(value, str) else json.dumps(value, allow_nan=False)
+        pairs.append(f"{key}={quote(text)}")
+    return quote(" ".join(pairs))
 
 
 
@@ -125,6 +125,8 @@ class SubprocessPipeWire:
             objects = json.loads(self.run(["pw-dump"]))
             pulse = {kind: json.loads(self.run(["pactl", "--format=json", "list", kind]))
                      for kind in ("sinks", "sources", "sink-inputs", "modules")}
+            devices = {str(obj["id"]): (obj.get("info") or {}).get("props", {})
+                       for obj in objects if obj.get("type") == "PipeWire:Interface:Device"}
             if not isinstance(objects, list) or any(not isinstance(items, list) for items in pulse.values()):
                 raise ValueError("Expected graph arrays")
             generation = next(((obj.get("info") or {}).get("cookie") for obj in objects
@@ -170,7 +172,15 @@ class SubprocessPipeWire:
                         "app_name": props.get("application.name") or name, "node_name": name,
                         "media_name": props.get("media.name", ""), "binary": props.get("application.process.binary", "")}
                 if media_class == "Audio/Source" and not name.startswith("openwave_") and not name.endswith(".monitor"):
-                    captures.append({"name": name, "description": props.get("node.description", name), "priority": int(props.get("priority.session", 0))})
+                    device = devices.get(str(props.get("device.id")), {})
+                    captures.append({
+                        "name": name, "description": props.get("node.description", name),
+                        "priority": int(props.get("priority.session", 0)),
+                        "identity": (generation, node["serial"]),
+                        "channels": int(props.get("audio.channels", 2)),
+                        "alsa_card": props.get("api.alsa.pcm.card", device.get("api.alsa.card")),
+                        "serial": props.get("device.serial", device.get("device.serial")),
+                    })
             mutes = {item["name"]: bool(item.get("mute")) for item in pulse["sources"]}
             return {"nodes": nodes, "ports": ports, "links": links, "sinks": sinks, "streams": streams,
                     "captures": captures, "capture_mutes": mutes, "modules": pulse["modules"], "default": default,
@@ -197,8 +207,8 @@ class SubprocessPipeWire:
 
     def create_sink(self, name, description):
         token = uuid.uuid4().hex
-        props = properties({"node.description": description, "media.name": name, "openwave.owner": token,
-                            "priority.session": 0, "monitor.channel-volumes": True, "state.restore-props": False})
+        props = pulse_properties({"node.description": description, "media.name": name, "openwave.owner": token,
+                                  "priority.session": 0, "monitor.channel-volumes": True, "state.restore-props": False})
         try:
             module_id = int(self.run(["pactl", "load-module", "module-null-sink", "sink_name=" + name,
                                       "channels=2", "channel_map=front-left,front-right", "sink_properties=" + props]).strip())
@@ -208,7 +218,9 @@ class SubprocessPipeWire:
 
     def destroy_sink(self, handle, graph):
         module_id, token = handle
-        owned = any(str(module.get("index")) == str(module_id) and token in str(module.get("argument", "")) for module in graph["modules"])
+        owned = any(str(node["props"].get("pulse.module.id")) == str(module_id)
+                    and node["props"].get("openwave.owner") == token
+                    for node in graph["nodes"].values())
         return not owned or self.command(["pactl", "unload-module", str(module_id)])
 
     def remove_mix_sink(self, name, graph):
@@ -227,9 +239,9 @@ class SubprocessPipeWire:
             playback.update({"media.class": "Audio/Source", "node.virtual": True,
                              "node.description": description or name})
         try:
-            return subprocess.Popen(["pw-loopback", "--capture-props=" + properties(capture),
-                                     "--playback-props=" + properties(playback)], stdout=subprocess.DEVNULL,
-                                    stderr=subprocess.DEVNULL, preexec_fn=_set_pdeathsig)
+            return child.spawn(["pw-loopback", "--capture-props=" + properties(capture),
+                                "--playback-props=" + properties(playback)], stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL)
         except OSError:
             return None
 
@@ -241,8 +253,9 @@ class Mixer:
     levels are retried every poll; no success is inferred from a living child.
     """
 
-    def __init__(self, pw=None, *, config_path=None, mixes_config_path=None, poll_interval=1.0):
+    def __init__(self, pw=None, *, config_path=None, mixes_config_path=None, poll_interval=1.0, capture_ready=None):
         self._pw = pw or SubprocessPipeWire()
+        self._capture_ready = capture_ready
         self._path = config_path or CONFIG_PATH
         self._mixes_config_path = mixes_config_path
         self._lock = threading.RLock()
@@ -296,7 +309,6 @@ class Mixer:
         self._owned_sinks = {}
         self._moved = {}
         self.mic = self.hp = None
-        self._reported_streams = set()
         atexit.register(self.stop)
 
     def _persist(self):
@@ -464,13 +476,6 @@ class Mixer:
     def request_volume_sync(self):
         self._wake.set()
 
-    def poll_streams(self):
-        """Compatibility for current UI; deltas concern cached observations only."""
-        self.request_stream_poll()
-        current = set(self.streams())
-        added, removed = current - self._reported_streams, self._reported_streams - current
-        self._reported_streams = current
-        return added, removed
 
     def start(self):
         with self._lock:
@@ -534,7 +539,7 @@ class Mixer:
             return False
         handle = self._owned_sinks.get(name)
         if handle is not None:
-            if any(str(module.get("index")) == str(handle[0]) and handle[1] in str(module.get("argument", "")) for module in graph["modules"]):
+            if any(handle[1] in str(module.get("argument", "")) for module in graph["modules"]):
                 return False
             del self._owned_sinks[name]
         handle = self._pw.create_sink(name, description)
@@ -600,8 +605,11 @@ class Mixer:
                 self._drop_route(key)
             return False
         route["missing"] = 0
-        if not self._pw.set_level(node["id"], volume, muted):
-            return False
+        applied = (graph.get("generation"), node.get("serial", node["id"]), volume, muted)
+        if route.get("applied") != applied:
+            if not self._pw.set_level(node["id"], volume, muted):
+                return False
+            route["applied"] = applied
         # Establish gain before audio can enter a newly created stream.
         playback_ok = publish or self._link_nodes(graph, name, target)
         capture_ok = self._link_nodes(graph, source, name + "_cap") if playback_ok else False
@@ -675,14 +683,26 @@ class Mixer:
             setup.install_mixes(mixes, path=self._mixes_config_path)
             self._definitions_written = definitions_revision
         self._sync_capture_mutes(graph)
-        # Until the UI owns its mic row, retain the established built-in id.
-        if "mic" not in records and self.mic:
-            records["mic"] = {"id": "mic", "kind": "device", "node_name": self.mic, "name": "Microphone", "level": 1.0}
         wanted_sinks = {mix["sink"] for mix in mixes.values()}
         ready = {mid for mid, mix in mixes.items() if self._ensure_sink(mix["sink"], mix["description"], graph)}
         ready &= self._sync_masters(graph, mixes)
         claims = claim_streams(records, graph["streams"])
         desired = set()
+        # Silence departing/muted sends before any group hand-over opens another.
+        for key, route in list(self._procs.items()):
+            if key[0] != "cell":
+                continue
+            _, sid, mid = key
+            source = records.get(sid)
+            cell = state.get(f"{sid}.{mid}", {})
+            if source is None or mid not in mixes or cell.get("volume", 0.0) <= 0:
+                self._drop_route(key)
+                continue
+            if source.get("muted") or cell.get("muted"):
+                self._route(key, route["spec"][0], route["spec"][1], route["name"],
+                            cell["volume"] * source.get("level", 1.0), True, graph)
+                if route["name"] in graph["nodes"] and not route.get("applied", (False,))[-1]:
+                    raise GraphError("Cannot silence the previous source; group hand-over deferred")
         wanted_moves = {}
         for sid, source in records.items():
             if sources.kind(source) == sources.KIND_APP:
@@ -698,7 +718,7 @@ class Mixer:
                         if self._pw.move_stream(stream, capture):
                             self._moved.setdefault(stream["serial"], stream["sink"])
             else:
-                capture = source.get("node_name") or (self.mic if sid == "mic" else None)
+                capture = source.get("node_name")
                 if capture not in {item["name"] for item in graph["captures"]}:
                     continue
             for mid in ready:
@@ -718,6 +738,12 @@ class Mixer:
             self._route(key, mix["sink"], None, mix_capture_name(mid), 1.0, False, graph,
                         publish=True, description=mix["description"])
             output = self.resolve_output(mid)
+            if output and self._capture_ready is not None and _is_wave_card(output):
+                stem = output.removeprefix("alsa_output.").rsplit(".", 1)[0]
+                captures = [item for item in graph["captures"]
+                            if item["name"].removeprefix("alsa_input.").rsplit(".", 1)[0] == stem]
+                if not captures or not all(self._capture_ready(item) for item in captures):
+                    output = None
             if output:
                 key = ("output", mid)
                 desired.add(key)

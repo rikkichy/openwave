@@ -31,7 +31,7 @@ class MeterLifecycleTests(unittest.TestCase):
         gi.require_version = lambda *_args: None
         repository = types.ModuleType("gi.repository")
         repository.GLib = glib
-        name = "_openwave_meter_regression"
+        name = "wavexlr._meter_regression"
         spec = importlib.util.spec_from_file_location(
             name, Path(__file__).parents[1] / "wavexlr" / "meter.py")
         self.module = importlib.util.module_from_spec(spec)
@@ -66,6 +66,17 @@ class MeterLifecycleTests(unittest.TestCase):
             proc.stdin.close()
             proc.stdout.close()
         self.assertTrue(stopped, "meter worker outlived bounded teardown")
+
+    def test_capture_readiness_requires_bytes_from_exact_generation(self):
+        self.monitor.start("mic", "capture", lambda _: None, identity=("server", 1))
+        self.await_condition(lambda: self.monitor.running("mic"))
+        self.assertFalse(self.monitor.ready("capture", ("server", 1)))
+        self.processes[-1].stdin.write(bytes(128))
+        self.processes[-1].stdin.flush()
+        self.await_condition(lambda: self.monitor.ready("capture", ("server", 1)))
+        self.monitor.start("mic", "capture", lambda _: None, identity=("server", 2))
+        self.assertFalse(self.monitor.ready("capture", ("server", 1)))
+        self.assertFalse(self.monitor.ready("capture", ("server", 2)))
 
     def await_condition(self, predicate):
         deadline = time.monotonic() + 3

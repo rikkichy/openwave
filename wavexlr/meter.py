@@ -23,10 +23,15 @@ import gi
 gi.require_version("GLib", "2.0")
 from gi.repository import GLib  # noqa: E402
 
+from . import child
+
 
 @dataclass(eq=False)
 class _Meter:
     callback: object
+    node_name: str = ""
+    identity: object = None
+    received: bool = False
     stop: threading.Event = field(default_factory=threading.Event)
     proc: object = None
     thread: object = None
@@ -47,14 +52,14 @@ class MeterMonitor:
         self._workers = set()
         self._lock = threading.RLock()
 
-    def start(self, source_id, source_node_name, callback, capture_sink=False):
+    def start(self, source_id, source_node_name, callback, capture_sink=False, *, identity=None):
         """Start a source tap, or a sink-monitor tap with capture_sink=True.
 
         Spawn errors produce a final zero callback; running() stays False.
         No callback or byte timestamp from an older generation can affect the
         replacement, including callbacks already queued on the GLib main loop.
         """
-        state = _Meter(callback)
+        state = _Meter(callback, source_node_name, identity)
         state.thread = threading.Thread(
             target=self._reader,
             args=(source_id, source_node_name, capture_sink, state),
@@ -73,6 +78,19 @@ class MeterMonitor:
             state = self._meters.get(source_id)
             return bool(state and state.proc and state.proc.poll() is None
                         and not state.stop.is_set())
+
+    def active(self, source_id):
+        """Include a generation whose worker is still starting its process."""
+        with self._lock:
+            state = self._meters.get(source_id)
+            return bool(state and state.thread.is_alive() and not state.stop.is_set())
+
+    def ready(self, node_name, identity):
+        """True only after this exact capture generation has delivered bytes."""
+        with self._lock:
+            return any(state.node_name == node_name and state.identity == identity
+                       and state.received and self.running(source_id)
+                       for source_id, state in self._meters.items())
 
     def stop(self, source_id):
         """Invalidate queued callbacks and request bounded off-thread cleanup."""
@@ -123,10 +141,14 @@ class MeterMonitor:
                 "node.name": f"openwave_meter_{source_id}",
                 "node.description": f"OpenWave level meter ({source_id})",
                 "application.name": "OpenWave",
+                "media.name": f"OpenWave meter: {source_id}",
+                "node.dont-fallback": True,
+                "node.dont-reconnect": True,
+                "node.dont-move": True,
             }
             if capture_sink:
                 props["stream.capture.sink"] = True
-            proc = subprocess.Popen(
+            proc = child.spawn(
                 ["pw-cat", "--record", "--target", node_name,
                  "--properties", json.dumps(props),
                  "--rate", str(self.SAMPLE_RATE), "--channels", "1",
@@ -156,6 +178,7 @@ class MeterMonitor:
                         if self._meters.get(source_id) is not state:
                             break
                         state.last_data = time.monotonic()
+                        state.received = True
                     if self.ui_suspended:
                         settled = False
                         tail = 0

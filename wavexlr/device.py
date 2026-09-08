@@ -333,6 +333,11 @@ class WaveDevice:
     def connected(self):
         return self._handle is not None
 
+    @property
+    def alsa_card(self):
+        """Exact ALSA card number paired with this USB handle."""
+        return self._card
+
     def connect(self, profile=None, bus=None, addr=None):
         """Open the exact scanned unit, only after its ALSA controls are ready."""
         if profile is None:
