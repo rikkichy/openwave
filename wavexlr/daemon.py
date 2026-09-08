@@ -1,47 +1,73 @@
-"""Headless daemon that just runs the audio capture fix."""
+"""Headless capture keepalive with observation-only health checks by default."""
 
+import argparse
 import logging
 import signal
-import time
-import sys
+import threading
 
-from .audio import AudioManager
+from .paths import data_file
 
-logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s")
 log = logging.getLogger("openwave.daemon")
 
 
-def main():
-    log.info("Starting OpenWave audio daemon")
+def _version():
+    path = data_file("VERSION")
+    if path is not None:
+        try:
+            with open(path) as stream:
+                return stream.read().strip()
+        except OSError:
+            pass
+    return "unknown"
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="openwave-daemon", description=__doc__)
+    parser.add_argument("--version", action="version", version=f"OpenWave {_version()}")
+    parser.add_argument("--auto-recover", action="store_true",
+                        help="allow bounded card-profile cycles and sink suspend/resume on confirmed faults")
+    args = parser.parse_args(argv)
+
+    # --help and --version must work without audio, USB or GTK dependencies.
+    from .audio import AudioManager
+    from .health import HealthMonitor
+
+    logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s")
+    stopped = threading.Event()
+
+    def shutdown(sig, frame):
+        stopped.set()
 
     def on_status(present, healthy, state):
         if not present:
             log.info("Device not detected")
         elif state == "silent":
-            log.error(
-                "Capture stream is up but every sample is zero -- the device "
-                "is delivering digital silence. Power-cycle it; a USB "
-                "re-enumeration does not clear this state."
-            )
+            log.error("Capture delivers digital silence; power-cycle the device")
         elif healthy:
             log.info("Capture keepalive active")
         else:
             log.warning("Establishing capture keepalive...")
 
-    mgr = AudioManager(on_status_change=on_status)
-    mgr.start()
+    manager = AudioManager(on_status_change=on_status)
+    health = HealthMonitor(auto_recover=args.auto_recover)
+    previous = {sig: signal.signal(sig, shutdown)
+                for sig in (signal.SIGTERM, signal.SIGINT)}
 
-    def shutdown(sig, frame):
-        log.info("Shutting down")
-        mgr.stop()
-        sys.exit(0)
-
-    signal.signal(signal.SIGTERM, shutdown)
-    signal.signal(signal.SIGINT, shutdown)
-
-    # Keep main thread alive
-    while True:
-        time.sleep(3600)
+    try:
+        log.info("Starting OpenWave audio daemon (auto-recover: %s)", args.auto_recover)
+        manager.start()
+        health.start()
+        stopped.wait()
+    finally:
+        try:
+            # Finish any owed restoration before tearing down capture pins.
+            health.stop()
+        finally:
+            try:
+                manager.stop()
+            finally:
+                for sig, handler in previous.items():
+                    signal.signal(sig, handler)
 
 
 if __name__ == "__main__":
