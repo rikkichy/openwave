@@ -24,7 +24,7 @@ tar -xzf "$OUT/$SOURCE" -C "$WORK"
 cd "$WORK/openwave-$V"
 [[ $(python3 packaging/version.py) == "$V" ]]
 STAGE="$WORK/deb"
-make install DESTDIR="$STAGE" PREFIX=/usr PYTHON=/usr/bin/python3
+make install DESTDIR="$STAGE" PREFIX=/usr PYTHON=/usr/bin/python3 INSTALL_METHOD=deb
 # Exercise the installed launchers, not imports from the checkout.
 PYTHON=/usr/bin/python3 dbus-run-session -- xvfb-run -a sh packaging/smoke-install.sh "$STAGE/usr"
 mkdir -p "$STAGE/DEBIAN"

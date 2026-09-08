@@ -47,6 +47,7 @@
               "PREFIX=${placeholder "out"}"
               "SITEPKG=${placeholder "out"}/${sitePkgs}"
               "PYTHON=${pythonEnv}/bin/python3"
+              "INSTALL_METHOD=nix"
             ];
 
             # Declarative version of the rule wavexlr/setup.py writes on

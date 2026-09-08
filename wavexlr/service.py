@@ -150,7 +150,7 @@ class _Systemd:
     def _user(self, *args, check=False):
         return subprocess.run(
             ["systemctl", "--user", *args],
-            capture_output=True, text=True, check=check,
+            capture_output=True, text=True, check=check, timeout=30,
         )
 
     def is_running(self):
@@ -244,20 +244,22 @@ class _Systemd:
         self._user("restart", SYSTEMD_UNIT, check=True)
 
     def uninstall(self):
-        self._user("stop", SYSTEMD_UNIT)
-        self._user("disable", SYSTEMD_UNIT)
-        path = os.path.join(os.path.expanduser("~/.config/systemd/user"), SYSTEMD_UNIT)
+        path = self.unit_path()
+        if os.path.islink(path):
+            raise RuntimeError("The service is managed externally; remove it through its manager.")
+        self._user("stop", SYSTEMD_UNIT, check=True)
+        self._user("disable", SYSTEMD_UNIT, check=True)
         try:
             os.unlink(path)
         except FileNotFoundError:
             pass
-        self._user("daemon-reload")
+        self._user("daemon-reload", check=True)
 
     def start(self):
         self._user("start", SYSTEMD_UNIT, check=True)
 
     def stop(self):
-        self._user("stop", SYSTEMD_UNIT)
+        self._user("stop", SYSTEMD_UNIT, check=True)
 
 
 def _pkexec_script(script_body):
@@ -364,11 +366,10 @@ ln -sf /etc/sv/{RUNIT_SERVICE} /var/service/{RUNIT_SERVICE}
 
     def uninstall(self):
         script = f"""#!/bin/sh
-sv down {RUNIT_SERVICE} 2>/dev/null || true
-sleep 1
+set -eu
+sv -w 15 down /var/service/{RUNIT_SERVICE}
 rm -f /var/service/{RUNIT_SERVICE}
-rm -rf /etc/sv/{RUNIT_SERVICE}
-rm -rf /var/log/{RUNIT_SERVICE}
+rm -f /etc/sv/{RUNIT_SERVICE}/run /etc/sv/{RUNIT_SERVICE}/log/run
 """
         _pkexec_script(script)
 
@@ -381,7 +382,7 @@ rm -rf /var/log/{RUNIT_SERVICE}
 
     def stop(self):
         r = subprocess.run(
-            ["sv", "down", RUNIT_SERVICE], capture_output=True, text=True,
+            ["sv", "-w", "15", "down", f"/var/service/{RUNIT_SERVICE}"], capture_output=True, text=True, timeout=20,
         )
         if r.returncode != 0:
             raise RuntimeError(r.stderr.strip() or "sv down failed")

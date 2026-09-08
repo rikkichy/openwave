@@ -1,10 +1,15 @@
 """Resolve icons at draw time without changing persisted source/mix choices."""
 
+from functools import lru_cache
+import logging
+import os
+
+from . import paths
+
+TRAY_ICON_COLORS = ("white", "black")
+
 # Import GTK only when a display is available; icon metadata is also used headless.
 _ALTERNATIVES = {
-    "openwave-symbolic": ("audio-input-microphone-symbolic",),
-    "openwave-muted-symbolic": ("microphone-sensitivity-muted-symbolic",),
-    "openwave-attention-symbolic": ("dialog-warning-symbolic",),
     "web-browser-symbolic": (
         "internet-web-browser-symbolic",
         "applications-internet-symbolic",
@@ -84,3 +89,17 @@ def resolve(name):
 
     _cache[name] = chosen
     return chosen
+
+
+@lru_cache(maxsize=None)
+def _asset_path(name):
+    path = paths.data_file("icons", f"{name}.svg")
+    if path is None:
+        logging.warning("icons: supplied artwork %s.svg is missing", name)
+    return path
+
+
+def theme_path(name):
+    """Directory containing supplied artwork, or empty when it is missing."""
+    path = _asset_path(name)
+    return os.path.dirname(path) if path else ""

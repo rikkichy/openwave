@@ -20,8 +20,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install runtime library
-        run: sudo apt-get update && sudo apt-get install -y libusb-1.0-0
+      - name: Install runtime and installation-test dependencies
+        run: sudo apt-get update && sudo apt-get install -y libusb-1.0-0 make
       - name: Run unit tests
         run: python -m unittest discover -s tests -t .
       - name: Compile Python sources

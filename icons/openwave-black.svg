@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" fill="none" role="img" aria-labelledby="title desc">
+  <title id="title">OpenWave — Routed W (black)</title>
+  <desc id="desc">A continuous asymmetric W with rounded bends, unequal troughs and a short horizontal output. Black #000000 on a transparent background.</desc>
+  <path d="M 32 55 L 61 174 C 67 197 85 195 92 173 L 116 103 L 140 157 C 149 180 171 179 179 154 L 201 87 C 204 78 210 74 220 74 H 238" stroke="#000000" stroke-width="28" stroke-linecap="butt" stroke-linejoin="round"/>
+</svg>

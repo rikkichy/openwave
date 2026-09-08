@@ -37,6 +37,15 @@ def _ancestors():
         d = parent
 
 
+def _recorded_prefix():
+    from .installation import data_prefix
+    try:
+        prefix = data_prefix(_MODULE_DIR)
+    except (OSError, ValueError, TypeError):
+        return None
+    return str(prefix) if prefix is not None else None
+
+
 def data_file(*parts):
     """Return an installed data file's path, or None if it is not present.
 
@@ -47,6 +56,9 @@ def data_file(*parts):
     rel = os.path.join(*parts)
 
     candidates = [os.path.join(os.path.dirname(_MODULE_DIR), rel)]
+    prefix = _recorded_prefix()
+    if prefix is not None:
+        candidates.append(os.path.join(prefix, "share", "openwave", rel))
     candidates += [
         os.path.join(d, "share", "openwave", rel) for d in _ancestors()
     ]
@@ -64,7 +76,9 @@ def bin_file(name):
     pointing at the install it was generated from, rather than whichever one
     happens to be first on PATH later.
     """
-    for d in _ancestors():
+    prefix = _recorded_prefix()
+    candidates = ([prefix] if prefix is not None else []) + list(_ancestors())
+    for d in candidates:
         candidate = os.path.join(d, "bin", name)
         if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
             return candidate

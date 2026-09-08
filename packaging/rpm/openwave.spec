@@ -30,7 +30,7 @@ through independent PipeWire mixes and output devices.
 
 %install
 make install DESTDIR=%{buildroot} PREFIX=/usr PYTHON=python3 \
-    SITEPKG=/usr/share/openwave/site-packages
+    SITEPKG=/usr/share/openwave/site-packages INSTALL_METHOD=rpm
 
 %files
 /usr/bin/openwave
@@ -41,8 +41,8 @@ make install DESTDIR=%{buildroot} PREFIX=/usr PYTHON=python3 \
 /usr/share/applications/openwave.desktop
 /usr/share/metainfo/com.github.openwave.metainfo.xml
 /usr/share/icons/hicolor/scalable/apps/openwave.svg
-/usr/share/icons/hicolor/symbolic/apps/openwave-symbolic.svg
-/usr/share/icons/hicolor/symbolic/apps/openwave-muted-symbolic.svg
-/usr/share/icons/hicolor/symbolic/apps/openwave-attention-symbolic.svg
+/usr/share/icons/hicolor/scalable/status/openwave-white.svg
+/usr/share/icons/hicolor/scalable/status/openwave-black.svg
+/usr/share/icons/hicolor/scalable/status/openwave-red.svg
 %doc /usr/share/doc/openwave/
 %license /usr/share/licenses/openwave/

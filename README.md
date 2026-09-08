@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="openwave.svg" alt="OpenWave logo" width="128" height="128">
+  <img src="icons/openwave.svg" alt="OpenWave logo" width="128" height="128">
 </p>
 
 <h1 align="center">OpenWave</h1>
@@ -137,6 +137,8 @@ openwave --hide
 
 From a checkout, use `python3 -m wavexlr --hide`. A hidden launch requires a working tray host; without one, the window remains available.
 
+Open **Application menu → Settings → Tray icon color** to choose **White** (the default) or **Black** for your panel. The choice is saved across launches. When a connected microphone is muted, the tray icon turns **red**; after unmuting, it returns to your selected color. A disconnected device keeps the selected color, with its disconnected status shown in the tooltip.
+
 ### Start at login
 
 Login preferences are available in the app. Alternatively, for the default `/usr/local` installation:
@@ -168,18 +170,26 @@ Do not start a second daemon beside the installed service. `--auto-recover` perm
 
 ### Uninstall
 
-For full cleanup, first use **Uninstall capture fix** in the app to remove native integration. Then remove application files with the same prefix and any module-directory override used at installation:
+Choose **Application menu → Uninstall OpenWave…**. The same action is available in first-run setup, including failed setup and the replug/Continue screen.
+
+For a manual or one-line installation, the dialog removes OpenWave's application files, capture service, owned audio/USB rules and start-at-login entries. **Settings and saved scenes are kept by default**; deleting them requires selecting the separate checkbox. Shared dependencies such as PipeWire and GTK are never removed.
+
+The headless CLI works without opening the GUI, audio devices or USB controls:
 
 ```bash
-sudo make -C /path/to/openwave uninstall PREFIX=/usr/local
-# make uninstall PREFIX="$HOME/.local"  # for a user-prefix install
+openwave --uninstall --dry-run          # inspect ownership and planned actions
+openwave --uninstall                    # confirm interactively
+openwave --uninstall --yes              # explicitly confirm without a prompt
+openwave --uninstall --delete-settings  # also remove settings and saved scenes
 ```
 
-Package removal is separate from host integration and user settings. If startup at login was enabled, remove its entry too:
+Run this as your login user, **not with sudo**. Administrator permission is requested only for owned system files that require it. The uninstaller coordinates with the running copy of the same installation and waits for workers to stop; it never broadly kills other audio applications.
 
-```bash
-rm -f ~/.config/autostart/openwave-autostart.desktop
-```
+**Package-managed installations** retain their package files. OpenWave can clean up its own native integration, then displays the package-manager or Nix configuration instructions. Flatpak directs removal to the host and cannot remove native host integration. Externally managed symlinks and package-owned configuration are retained.
+
+Manual installs carry an exact installation inventory, so uninstalling does not require the original checkout. Identifiable legacy layouts are supported; ambiguous ownership or modified recorded files block deletion instead of guessing. Partial failures are reported with completed steps and a retry option. If application files were already partially removed, a private recovery bundle provides a printed retry command without requiring a checkout.
+
+`make uninstall` is an explicit **application-files-only** compatibility/build target; it does not remove user integration or settings. Use the same `PREFIX`, `SITEPKG` and any staging `DESTDIR` used at installation.
 
 ## How it works
 

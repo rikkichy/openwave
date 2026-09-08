@@ -32,14 +32,36 @@ import wavexlr
 
 prefix = Path(sys.argv[1]).resolve()
 assert Path(wavexlr.__file__).resolve().is_relative_to(prefix)
+from wavexlr.installation import inspect_installation, validate_installation
+installation = inspect_installation()
+assert installation.problem is None, installation.problem
+if installation.prefix is not None:
+    assert installation.prefix == prefix, installation
+if installation.receipt is not None:
+    assert installation.receipt == prefix / 'share/openwave/install-manifest.json'
+if installation.method == 'manual':
+    validate_installation(installation)
+    assert all(path.is_relative_to(prefix) for path in installation.files)
+else:
+    assert installation.method in {'deb', 'rpm', 'arch', 'nix', 'flatpak'}
+    assert not installation.files and not installation.directories
 for module in pkgutil.walk_packages(wavexlr.__path__, 'wavexlr.'):
     if module.name not in {'wavexlr.__main__', 'wavexlr.daemon'}:
         importlib.import_module(module.name)
 from wavexlr.paths import data_file
+icon_names = ('openwave.svg', 'openwave-white.svg', 'openwave-black.svg', 'openwave-red.svg')
 for resource in [('VERSION',), ('pipewire', '52-openwave-mixes.conf'),
-                 ('wireplumber', '51-openwave-wave-xlr.conf'), ('icons', 'openwave.svg')]:
+                 ('wireplumber', '51-openwave-wave-xlr.conf'),
+                 *(('icons', name) for name in icon_names)]:
     path = data_file(*resource)
     assert path and Path(path).resolve().is_relative_to(prefix), resource
+installed_icons = prefix / 'share/openwave/icons'
+assert {path.name for path in installed_icons.glob('*.svg')} == set(icon_names)
+for name in icon_names:
+    context = 'apps' if name == 'openwave.svg' else 'status'
+    themed_icon = prefix / 'share/icons/hicolor/scalable' / context / name
+    assert themed_icon.read_bytes() == (installed_icons / name).read_bytes(), name
+assert (prefix / 'share/doc/openwave/icons/openwave.svg').read_bytes() == (installed_icons / 'openwave.svg').read_bytes()
 Gtk.init()
 Adw.init()
 window = Gtk.Window(title='Installed OpenWave GTK smoke')

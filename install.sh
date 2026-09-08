@@ -72,7 +72,7 @@ fi
 # --- install ------------------------------------------------------------------
 msg "installing to $PREFIX"
 python3 "$SRC/packaging/version.py"
-$SUDO make -C "$SRC" install PREFIX="$PREFIX"
+$SUDO make -C "$SRC" install PREFIX="$PREFIX" INSTALL_METHOD=manual
 
 # refresh desktop database when possible (failures are harmless)
 if command -v update-desktop-database >/dev/null 2>&1; then

@@ -14,6 +14,7 @@ ITEM_XML = """
     <property name="Title" type="s" access="read"/>
     <property name="Status" type="s" access="read"/>
     <property name="IconName" type="s" access="read"/>
+    <property name="IconThemePath" type="s" access="read"/>
     <property name="ToolTip" type="(sa(iiay)ss)" access="read"/>
     <property name="Menu" type="o" access="read"/>
     <property name="ItemIsMenu" type="b" access="read"/>
@@ -94,17 +95,15 @@ MENU_XML = """
 """
 
 
-# Packaged icons resolve to stock themed icons when running from a checkout.
-ICON_LIVE = "openwave-symbolic"
-ICON_MUTED = "openwave-muted-symbolic"
-ICON_ABSENT = "openwave-attention-symbolic"
-
-
-def compute(connected, hardware_muted, row_muted, display_name=None):
+def compute(connected, hardware_muted, row_muted, display_name=None, *,
+            icon_color="white"):
     """Return tray state; either hardware or matrix mute means not captured."""
+    if icon_color not in icons.TRAY_ICON_COLORS:
+        icon_color = icons.TRAY_ICON_COLORS[0]
+    live_icon = f"openwave-{icon_color}"
     if not connected:
         return {
-            "icon": ICON_ABSENT,
+            "icon": live_icon,
             "status": "Active",
             "tooltip": "No device connected",
             "mute_label": "Mute Mic",
@@ -124,7 +123,7 @@ def compute(connected, hardware_muted, row_muted, display_name=None):
         detail = "Live"
 
     return {
-        "icon": ICON_MUTED if muted else ICON_LIVE,
+        "icon": "openwave-red" if muted else live_icon,
         "status": "Active",
         "tooltip": f"{display_name}: {detail}" if display_name else detail,
         "mute_label": "Unmute Mic" if muted else "Mute Mic",
@@ -138,7 +137,7 @@ class TrayIcon:
 
     register() returns False if no host can display it. unregister() releases
     both exported objects; call it on application shutdown. set_state accepts
-    the selected device's optional display_name for its tooltip.
+    the selected device's optional display_name and white/black icon_color.
     """
 
     def __init__(self, on_activate=None, on_mute=None, on_quit=None,
@@ -238,13 +237,14 @@ class TrayIcon:
         return False
 
     def set_state(self, connected, hardware_muted=False, row_muted=False,
-                  display_name=None):
+                  display_name=None, *, icon_color="white"):
         """Show what the microphone is actually doing. Returns True if it moved.
 
         Announced only on a real change: the poll behind this runs at 10 Hz,
         and a host redraws on every NewIcon it is handed.
         """
-        new = compute(connected, hardware_muted, row_muted, display_name)
+        new = compute(connected, hardware_muted, row_muted, display_name,
+                      icon_color=icon_color)
         if new == self._state:
             return False
 
@@ -296,12 +296,14 @@ class TrayIcon:
             GLib.idle_add(self._invoke, self._on_open)
 
     def _on_item_get_property(self, conn, sender, path, iface, prop):
+        if prop == "IconThemePath":
+            return GLib.Variant("s", icons.theme_path(self._state["icon"]))
         props = {
             "Category": GLib.Variant("s", "Hardware"),
             "Id": GLib.Variant("s", "openwave"),
             "Title": GLib.Variant("s", "OpenWave"),
             "Status": GLib.Variant("s", self._state["status"]),
-            "IconName": GLib.Variant("s", icons.resolve(self._state["icon"])),
+            "IconName": GLib.Variant("s", self._state["icon"]),
             "ToolTip": GLib.Variant(
                 "(sa(iiay)ss)",
                 ("", [], "OpenWave", self._state["tooltip"])),
@@ -318,13 +320,14 @@ class TrayIcon:
                 "label": GLib.Variant("s", "Open OpenWave"),
                 "visible": GLib.Variant("b", True),
                 "enabled": GLib.Variant("b", True),
-                "icon-name": GLib.Variant("s", icons.resolve(ICON_LIVE)),
+                "icon-name": GLib.Variant("s", "openwave"),
             },
             2: {
                 "label": GLib.Variant("s", self._state["mute_label"]),
                 "visible": GLib.Variant("b", True),
                 "enabled": GLib.Variant("b", self._state["mute_enabled"]),
-                "icon-name": GLib.Variant("s", icons.resolve(ICON_MUTED)),
+                "icon-name": GLib.Variant(
+                    "s", icons.resolve("microphone-sensitivity-muted-symbolic")),
             },
             3: {
                 "type": GLib.Variant("s", "separator"),
@@ -401,5 +404,6 @@ class TrayIcon:
         if prop == "Status":
             return GLib.Variant("s", "normal")
         if prop == "IconThemePath":
-            return GLib.Variant("as", [])
+            theme_path = icons.theme_path("openwave")
+            return GLib.Variant("as", [theme_path] if theme_path else [])
         return None

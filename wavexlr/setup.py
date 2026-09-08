@@ -66,12 +66,7 @@ def service_installed():
 
 
 def service_needs_refresh():
-    """Whether an installed service still starts the daemon this install ships.
-
-    Separate from service_installed() so run_uninstall() keeps removing a unit
-    that has gone stale, which a stricter service_installed() would make it
-    walk past and leave enabled.
-    """
+    """Whether an installed service still starts this installation's daemon."""
     return service.needs_refresh()
 
 
@@ -102,20 +97,6 @@ def needs_setup():
         or service_needs_refresh()
         or not wireplumber_installed()
         or not mixes_installed()
-    )
-
-
-def anything_installed():
-    """Whether any part of the integration is still on disk.
-
-    Not the inverse of needs_setup(): a partial install both needs setup and
-    has things left to remove.
-    """
-    return (
-        udev_installed()
-        or service_installed()
-        or wireplumber_installed()
-        or mixes_installed()
     )
 
 
@@ -258,77 +239,3 @@ def run_setup():
             return False, f"Failed to update service: {e}"
 
     return True, ". ".join(messages) if messages else "Already configured"
-
-
-def uninstall_service():
-    """Stop, disable, and remove the audio service via the active backend."""
-    _require_native()
-    service.uninstall()
-
-
-def uninstall_wireplumber():
-    """Remove the WirePlumber rule from the user's config."""
-    _require_native()
-    try:
-        os.unlink(WIREPLUMBER_PATH)
-    except FileNotFoundError:
-        return False
-    return True
-
-
-def uninstall_mixes():
-    """Remove the mix sinks config from the user's PipeWire config."""
-    try:
-        os.unlink(MIXES_PATH)
-    except FileNotFoundError:
-        return False
-    return True
-
-
-def uninstall_udev():
-    """Remove udev rule via pkexec."""
-    _require_native()
-    script = f"""#!/bin/sh
-rm -f {UDEV_PATH} {UDEV_PATH_OLD}
-udevadm control --reload-rules
-"""
-    tmp = "/tmp/openwave-udev-remove.sh"
-    with open(tmp, "w") as f:
-        f.write(script)
-    os.chmod(tmp, 0o755)
-    r = subprocess.run(["pkexec", tmp], capture_output=True, text=True)
-    try:
-        os.unlink(tmp)
-    except FileNotFoundError:
-        pass
-    return r.returncode == 0
-
-
-def run_uninstall():
-    """Remove capture fix service, WirePlumber rule, and udev rule. Returns (success, message)."""
-    if is_sandboxed():
-        return False, SANDBOX_GUIDANCE
-    messages = []
-
-    if service_installed():
-        try:
-            uninstall_service()
-            messages.append("Audio service removed")
-        except Exception as e:
-            return False, f"Failed to remove service: {e}"
-
-    if wireplumber_installed():
-        if uninstall_wireplumber():
-            messages.append("WirePlumber rule removed")
-
-    if mixes_installed():
-        if uninstall_mixes():
-            messages.append("Mix sinks removed")
-
-    if udev_installed():
-        if uninstall_udev():
-            messages.append("USB permissions removed")
-        else:
-            return False, "Failed to remove USB permissions (pkexec cancelled?)"
-
-    return True, ". ".join(messages) if messages else "Already uninstalled"

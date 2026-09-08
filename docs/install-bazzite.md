@@ -37,7 +37,7 @@ make install PREFIX="$HOME/.local"
 "$HOME/.local/bin/openwave"
 ```
 
-The default module location is `<prefix>/share/openwave/site-packages`, not the host Python's read-only `/usr/lib` tree. Add `~/.local/bin` to your session's PATH if needed. Uninstall this layout with `make uninstall PREFIX="$HOME/.local"`; host setup and saved user settings are separate.
+The default module location is `<prefix>/share/openwave/site-packages`, not the host Python's read-only `/usr/lib` tree. Add `~/.local/bin` to your session's PATH if needed. Use **Application menu → Uninstall OpenWave…** or `openwave --uninstall` to remove a manual user-prefix installation and its owned native integration without a checkout. Settings/scenes are preserved unless explicitly selected; package-managed files and declarative configuration stay with their manager. See [uninstall options](../README.md#uninstall).
 
 ## First-run host integration
 

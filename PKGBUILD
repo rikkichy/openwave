@@ -15,5 +15,5 @@ sha256sums=()
 
 package() {
     cd "$startdir"
-    make install DESTDIR="$pkgdir" PREFIX=/usr PYTHON=python3
+    make install DESTDIR="$pkgdir" PREFIX=/usr PYTHON=python3 INSTALL_METHOD=arch
 }

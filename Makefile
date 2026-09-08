@@ -1,6 +1,7 @@
 PREFIX ?= /usr/local
 DESTDIR ?=
 PYTHON ?= python3
+INSTALL_METHOD ?= manual
 # A private, Python-version-independent module tree; distributions may override.
 SITEPKG ?= $(PREFIX)/share/openwave/site-packages
 
@@ -36,11 +37,11 @@ install: check-version
 	install -Dm644 VERSION "$(APPDIR)/VERSION"
 	install -Dm644 com.github.openwave.metainfo.xml "$(DATADIR)/metainfo/com.github.openwave.metainfo.xml"
 	install -Dm644 icons/openwave.svg "$(DATADIR)/icons/hicolor/scalable/apps/openwave.svg"
-	install -dm755 "$(DATADIR)/icons/hicolor/symbolic/apps" "$(APPDIR)/icons"
-	install -m644 icons/*-symbolic.svg "$(DATADIR)/icons/hicolor/symbolic/apps/"
-	install -m644 icons/*.svg "$(APPDIR)/icons/"
+	install -dm755 "$(DATADIR)/icons/hicolor/scalable/status" "$(APPDIR)/icons"
+	install -m644 icons/openwave-white.svg icons/openwave-black.svg icons/openwave-red.svg "$(DATADIR)/icons/hicolor/scalable/status/"
+	install -m644 icons/openwave.svg icons/openwave-white.svg icons/openwave-black.svg icons/openwave-red.svg "$(APPDIR)/icons/"
 	install -Dm644 README.md "$(DOCDIR)/README.md"
-	install -Dm644 openwave.svg "$(DOCDIR)/openwave.svg"
+	install -Dm644 icons/openwave.svg "$(DOCDIR)/icons/openwave.svg"
 	if [ -d docs ]; then \
 		install -dm755 "$(DOCDIR)/docs"; \
 		tar --mode='u=rwX,go=rX' -C docs -cf - . | tar --no-same-owner --no-same-permissions -C "$(DOCDIR)/docs" -xf -; \
@@ -49,10 +50,7 @@ install: check-version
 	fi
 	install -Dm644 packaging/asset-attribution.txt "$(DOCDIR)/asset-attribution.txt"
 	install -Dm644 LICENSE "$(LICENSEDIR)/LICENSE"
+	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) -m wavexlr.installation --record --prefix "$(PREFIX)" --sitepkg "$(SITEPKG)" --destdir "$(DESTDIR)" --method "$(INSTALL_METHOD)"
 
 uninstall:
-	rm -rf "$(DESTDIR)$(SITEPKG)/wavexlr"
-	rm -f "$(BINDIR)/openwave" "$(BINDIR)/openwave-daemon" "$(BINDIR)/openwave-diag" "$(BINDIR)/openwave-probe" "$(DESKTOPDIR)/openwave.desktop"
-	rm -f "$(DATADIR)/metainfo/com.github.openwave.metainfo.xml" "$(DATADIR)/icons/hicolor/scalable/apps/openwave.svg"
-	rm -f "$(DATADIR)/icons/hicolor/symbolic/apps/openwave-symbolic.svg" "$(DATADIR)/icons/hicolor/symbolic/apps/openwave-muted-symbolic.svg" "$(DATADIR)/icons/hicolor/symbolic/apps/openwave-attention-symbolic.svg"
-	rm -rf "$(APPDIR)" "$(DOCDIR)" "$(LICENSEDIR)"
+	$(PYTHON) -m wavexlr.uninstall --files-only --prefix "$(PREFIX)" --sitepkg "$(SITEPKG)" --destdir "$(DESTDIR)" --yes

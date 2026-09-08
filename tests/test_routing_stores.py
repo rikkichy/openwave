@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from wavexlr import mixes, setup, sources
+from wavexlr import mixes, setup, sources, uninstall
 
 
 class StoreTests(unittest.TestCase):
@@ -94,7 +94,7 @@ class StoreTests(unittest.TestCase):
             with patch.object(setup.service, "install", side_effect=AssertionError("Host service touched")):
                 self.assertTrue(setup.is_sandboxed())
                 self.assertFalse(setup.run_setup()[0])
-                self.assertFalse(setup.run_uninstall()[0])
+                self.assertFalse(uninstall.execute(uninstall.inspect()).success)
                 with self.assertRaises(RuntimeError):
                     setup.install_service()
                 destination = Path(directory) / "mixes.conf"

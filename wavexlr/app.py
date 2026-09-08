@@ -23,6 +23,7 @@ from .sourcedialog import AddSourceDialog
 from . import paths, setup, service, sources as sources_module, mixes as mixes_module, desktop as desktop_module
 from . import scenes as scenes_module
 from . import effects, calibrate
+from .icons import TRAY_ICON_COLORS
 
 logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s")
 KNOB_LABELS = {"gain": "Gain", "hp": "Headphones", "mix": "Monitor Mix"}
@@ -50,6 +51,7 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         self._devs = []
         self._device_keys = {}
         self._device_executors = {}
+        self._retiring_devices = {}
         self._device_states = {}
         self._polling_devices = set()
         self._device_failures = {}
@@ -58,6 +60,8 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         self._selector_updating = False
         self._usb_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="openwave-discovery")
         self._shutting_down = False
+        self._shutdown_prepared = False
+        self._shutdown_drained = False
         self._connect_pending = False
         self._reconnect_id = self._poll_id = self._stream_poll_id = None
         self._gain_timeout = self._hp_timeout = self._mix_timeout = None
@@ -109,9 +113,15 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         self.routing_label = Gtk.Label(xalign=0, wrap=True, max_width_chars=38)
         service_box.append(self.service_label)
         service_box.append(self.routing_label)
-        self.uninstall_btn = Gtk.Button(label="Uninstall capture fix")
-        self.uninstall_btn.connect("clicked", self._on_uninstall_clicked)
-        service_box.append(self.uninstall_btn)
+        settings_action = Gio.SimpleAction.new("settings", None)
+        settings_action.connect("activate", self._show_settings)
+        self.add_action(settings_action)
+        menu = Gio.Menu()
+        menu.append("Settings", "win.settings")
+        menu.append("Uninstall OpenWave…", "app.uninstall")
+        header.pack_end(Gtk.MenuButton(
+            icon_name="open-menu-symbolic", menu_model=menu,
+            tooltip_text="Application menu"))
         service_pop.set_child(service_box)
         self.service_btn.set_popover(service_pop)
         header.pack_start(self.service_btn)
@@ -277,9 +287,9 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         # Output routing is per mix and lives in each mix column's header
         # menu, not here — one device combo could only ever speak for one mix.
 
-        # --- Startup ---
-        startup_group = Adw.PreferencesGroup(title="Startup")
-        parent.append(startup_group)
+        # --- Application settings ---
+        settings_group = Adw.PreferencesGroup(title="Application settings")
+        parent.append(settings_group)
 
         enabled, hidden = desktop_module.autostart_state()
         self.autostart_row = Adw.SwitchRow(
@@ -289,7 +299,7 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         self.autostart_row.set_active(enabled)
         self._autostart_handler = self.autostart_row.connect(
             "notify::active", self._on_autostart_toggled)
-        startup_group.add(self.autostart_row)
+        settings_group.add(self.autostart_row)
 
         self.tray_row = Adw.SwitchRow(
             title="Start in the tray",
@@ -299,7 +309,18 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         # Only meaningful when something is starting it for you.
         self.tray_row.set_sensitive(enabled)
         self.tray_row.connect("notify::active", self._on_start_hidden_toggled)
-        startup_group.add(self.tray_row)
+        settings_group.add(self.tray_row)
+
+        color = self._load_ui_state().get("tray_icon_color", TRAY_ICON_COLORS[0])
+        self.tray_icon_color = color if color in TRAY_ICON_COLORS else TRAY_ICON_COLORS[0]
+        self.tray_color_row = Adw.ComboRow(
+            title="Tray icon color",
+            subtitle="White for dark panels, black for light panels. Red when muted.",
+            model=Gtk.StringList.new([color.title() for color in TRAY_ICON_COLORS]),
+        )
+        self.tray_color_row.set_selected(TRAY_ICON_COLORS.index(self.tray_icon_color))
+        self.tray_color_row.connect("notify::selected", self._on_tray_icon_color_changed)
+        settings_group.add(self.tray_color_row)
 
         # --- Device info ---
         # Titleless group so the expander reads as a single collapsed line: it
@@ -333,47 +354,18 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         if setup.is_sandboxed():
             self._service_problem = True
             self.service_label.set_label("Sandbox: install USB permissions and the capture service on the host. Native setup is unavailable here.")
-            self.uninstall_btn.set_visible(False)
             self.service_btn.set_visible(True)
             return
         def query():
-            return service.is_running(), service.is_failed(), setup.anything_installed()
+            return service.is_running(), service.is_failed()
         def apply(result):
-            active, failed, installed = result
+            active, failed = result
             self._service_problem = not active
             self.service_label.set_label("Capture service running" if active else
                 "Capture service failed; inspect its user journal" if failed else "Capture service not running")
-            self.uninstall_btn.set_visible(installed)
             self.service_btn.set_visible(self._service_problem or bool(self.mixer.last_error()))
         self._usb_async(query, apply, lambda error: self._show_error("Service status unavailable", error))
 
-    def _on_uninstall_clicked(self, btn):
-        dialog = Adw.AlertDialog(
-            heading="Uninstall Capture Fix?",
-            body="This will remove the audio service, the WirePlumber rule, "
-                 "the mix sinks and the USB permissions.\n\nYou can reinstall "
-                 "them by restarting OpenWave.",
-        )
-        dialog.add_response("cancel", "Cancel")
-        dialog.add_response("uninstall", "Uninstall")
-        dialog.set_response_appearance("uninstall", Adw.ResponseAppearance.DESTRUCTIVE)
-        dialog.set_default_response("cancel")
-        dialog.choose(self, None, self._on_uninstall_response)
-
-    def _on_uninstall_response(self, dialog, result):
-        if dialog.choose_finish(result) != "uninstall":
-            return
-        self.matrix.set_sensitive(False)
-        def uninstall():
-            self.mixer.stop()
-            return setup.run_uninstall()
-        def done(result):
-            success, message = result
-            if success:
-                self.get_application().quit()
-            else:
-                self._show_error("Uninstall failed", message + "\nReopen OpenWave to resume routing.")
-        self._usb_async(uninstall, done, lambda error: self._show_error("Uninstall failed", error))
 
     def _usb_async(self, fn, on_done=None, on_error=None, *, device=None):
         """Dispatch discovery or one device's serialized operations."""
@@ -534,13 +526,18 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         self._refresh_device_selector()
         if executor is not None:
             self._closing_units.add(key)
+            self._retiring_devices[device] = executor
             executor.shutdown(wait=False, cancel_futures=True)
 
             def close():
                 executor.shutdown(wait=True)
                 device.disconnect()
 
-            self._usb_async(close, lambda _: self._closing_units.discard(key))
+            def closed(_result):
+                self._closing_units.discard(key)
+                self._retiring_devices.pop(device, None)
+
+            self._usb_async(close, closed)
 
     def _on_device_error(self, device, error):
         key = self._device_keys.get(device)
@@ -603,12 +600,15 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         if failures >= 3:
             self._on_device_error(device, error)
 
-    def shutdown(self):
-        """Quiesce every device worker before closing its libusb handle."""
+    def prepare_shutdown(self):
+        """Freeze GTK-owned work; draining belongs on a separate worker."""
+        if self._shutdown_prepared:
+            return
         self._shutting_down = True
-        self.health.stop()
+        self.get_content().set_sensitive(False)
+        for name in self.list_actions():
+            self.lookup_action(name).set_enabled(False)
         self._cancel_calibration()
-        self._calibration_executor.shutdown(wait=False, cancel_futures=True)
         for source_id in list(self._fx_debounce_ids):
             self._cancel_fx_edit(source_id)
         for name in (
@@ -622,12 +622,49 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         for source_id in self._cell_debounce_ids.values():
             GLib.source_remove(source_id)
         self._cell_debounce_ids.clear()
-        self._usb_executor.shutdown(wait=True, cancel_futures=False)
-        for device, executor in self._device_executors.items():
-            executor.shutdown(wait=True, cancel_futures=True)
-            device.disconnect()
-        self._device_executors.clear()
+        self._shutdown_prepared = True
+
+    def drain_shutdown(self):
+        """Drain all owners before deletion, without touching GTK."""
+        if self._shutdown_drained:
+            return
+        errors = []
+
+        def stop(operation):
+            try:
+                operation()
+            except Exception as error:
+                errors.append(str(error))
+
+        stop(self.health.stop)
+        stop(lambda: self._calibration_executor.shutdown(wait=True, cancel_futures=True))
+        # Retired devices are closed by discovery jobs: do not cancel those.
+        stop(lambda: self._usb_executor.shutdown(wait=True, cancel_futures=False))
+        for workers in (self._device_executors, self._retiring_devices):
+            for device, executor in list(workers.items()):
+                try:
+                    executor.shutdown(wait=True, cancel_futures=True)
+                    device.disconnect()
+                except Exception as error:
+                    errors.append(str(error))
+                else:
+                    del workers[device]
+        stop(self.mixer.stop)
+        stop(self.meter.stop_all)
+        try:
+            if not self.meter.wait_stopped():
+                errors.append("Audio meter workers have not stopped.")
+        except Exception as error:
+            errors.append(str(error))
+        if errors:
+            raise RuntimeError("\n".join(errors))
         self._devs.clear()
+        self._shutdown_drained = True
+
+    def shutdown(self):
+        """Preserve synchronous shutdown callers outside the uninstall flow."""
+        self.prepare_shutdown()
+        self.drain_shutdown()
 
     def _apply_profile(self, profile):
         """Adapt the UI to the connected device model."""
@@ -753,6 +790,8 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         self._stream_poll_id = GLib.timeout_add_seconds(2, self._stream_poll_tick)
 
     def _stream_poll_tick(self):
+        if self._shutting_down:
+            return False
         self.mixer.request_stream_poll()
         captures = self.mixer.capture_sources()
         self._add_discovered_inputs(captures)
@@ -796,6 +835,8 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         self.meter.start(source_id, target, lambda level, sid=source_id: self._set_source_level(sid, level), capture_sink=True)
 
     def _set_source_level(self, source_id, level):
+        if self._shutting_down:
+            return
         self._remote_levels[f"src:{source_id}"] = round(float(level), 4)
         cell = self.matrix.source(source_id)
         if cell is not None:
@@ -838,6 +879,8 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         dialog.choose(self, None, lambda d, r: self._on_remove_response(d, r, source_id))
 
     def _on_remove_response(self, dialog, result, source_id):
+        if self._shutting_down:
+            return
         if dialog.choose_finish(result) != "remove" or source_id not in self._sources:
             return
         source = self._sources[source_id]
@@ -860,6 +903,8 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         self._save_ui_state()
 
     def _on_cell_volume_changed(self, _cell, value, source_id, mix_id):
+        if self._shutting_down:
+            return
         # During a drag, value-changed fires continuously; coalesce into a
         # single set_cell after the slider settles.
         key = (source_id, mix_id)
@@ -877,6 +922,8 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         return False
 
     def _on_cell_mute_toggled(self, _cell, muted, source_id, mix_id):
+        if self._shutting_down:
+            return
         if source_id not in self._sources or mix_id not in self._mixes:
             return
         state = self.mixer.get_cell(source_id, mix_id)
@@ -922,6 +969,8 @@ class WaveXLRWindow(Adw.ApplicationWindow):
             self.maximize()
 
     def _save_ui_state(self):
+        if self._shutting_down:
+            return
         previous = self._load_ui_state()
         size = (self.get_width(), self.get_height())
         if self.is_maximized() or min(size) <= 0:
@@ -931,11 +980,14 @@ class WaveXLRWindow(Adw.ApplicationWindow):
                 "width": size[0], "height": size[1], "maximized": self.is_maximized(),
                 "offered_capture_nodes": sorted(self._offered_nodes),
                 "gain_locked": self.gain_lock.get_active(),
+                "tray_icon_color": self.tray_icon_color,
             })
         except OSError as error:
             logging.warning("Cannot save interface preferences: %s", error)
 
     def _on_autostart_toggled(self, row, _param):
+        if self._shutting_down:
+            return
         enabled, _hidden = desktop_module.set_autostart(
             row.get_active(), self.tray_row.get_active())
         self.tray_row.set_sensitive(enabled)
@@ -946,8 +998,27 @@ class WaveXLRWindow(Adw.ApplicationWindow):
                 row.set_active(enabled)
 
     def _on_start_hidden_toggled(self, row, _param):
+        if self._shutting_down:
+            return
         if self.autostart_row.get_active():
             desktop_module.set_autostart(True, row.get_active())
+
+    def _show_settings(self, _action, _parameter):
+        if self._shutting_down:
+            return
+        self.sidebar_toggle.set_active(True)
+        def focus():
+            if not self._shutting_down:
+                self.tray_color_row.grab_focus()
+            return False
+        GLib.idle_add(focus)
+
+    def _on_tray_icon_color_changed(self, row, _parameter):
+        if self._shutting_down or row.get_selected() >= len(TRAY_ICON_COLORS):
+            return
+        self.tray_icon_color = TRAY_ICON_COLORS[row.get_selected()]
+        self._save_ui_state()
+        self._notify_tray()
 
     def _output_entries(self, mix_id, sinks, default_sink):
         """(entries, current, summary, monitored) for one mix's header menu."""
@@ -1103,6 +1174,8 @@ class WaveXLRWindow(Adw.ApplicationWindow):
 
     def _on_device_source_confirmed(self, _dialog, name, node_name, icon_name,
                                     group=""):
+        if self._shutting_down:
+            return
         # Queue the re-snapshot before installing: the reconcile that
         # _install_source triggers refuses to wire a node the snapshot has not
         # seen, and the worker runs queued tasks in insertion order, so the
@@ -1129,13 +1202,19 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         self._push_remote_state()
 
     def _on_mix_output_changed(self, _matrix, mix_id, output):
+        if self._shutting_down:
+            return
         self.mixer.set_output(mix_id, output)
         self._refresh_outputs()
 
     def _on_mix_volume_changed(self, _matrix, mix_id, value):
+        if self._shutting_down:
+            return
         self.mixer.set_mix_volume(mix_id, value)
 
     def _on_mix_created(self, _dialog, name, icon_name):
+        if self._shutting_down:
+            return
         mix = mixes_module.new_mix(name=name, icon_name=icon_name)
         self._mixes = mixes_module.add(self._mixes, mix)
         self.mixer.set_mixes(self._mixes)
@@ -1145,6 +1224,8 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         self._refresh_outputs()
 
     def _on_mix_renamed(self, _dialog, name, icon_name, mix_id):
+        if self._shutting_down:
+            return
         if mix_id not in self._mixes:
             return
         self._mixes = mixes_module.update(self._mixes, mix_id, name=name, icon_name=icon_name)
@@ -1159,6 +1240,8 @@ class WaveXLRWindow(Adw.ApplicationWindow):
                 del self._cell_debounce_ids[key]
 
     def _on_remove_mix_response(self, dialog, result, mix_id):
+        if self._shutting_down:
+            return
         if dialog.choose_finish(result) != "delete" or mix_id not in self._mixes:
             return
         self._cancel_cell_edits(mix_id=mix_id)
@@ -1222,6 +1305,8 @@ class WaveXLRWindow(Adw.ApplicationWindow):
             row.connect("fx-autotune", self._on_fx_autotune, source_id)
 
     def _install_source(self, source):
+        if self._shutting_down:
+            return
         self._sources = sources_module.add(self._sources, source)
         self.mixer.set_sources(self._sources)
         self._add_source_widget(source)
@@ -1263,6 +1348,8 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         dialog.present(self)
 
     def _on_source_edited(self, _dialog, source_id, name, binding, icon_name, group=""):
+        if self._shutting_down:
+            return
         if source_id not in self._sources:
             return
         fields = dict(name=name, icon_name=icon_name, group=group)
@@ -1285,6 +1372,8 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         self._refresh_mix_emptiness()
 
     def _on_move_source_clicked(self, _matrix, source_id, delta):
+        if self._shutting_down:
+            return
         if source_id not in self._sources:
             return
         self._sources = sources_module.reorder(self._sources, source_id, delta)
@@ -1295,6 +1384,8 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         self._wire_matrix_cells()
 
     def set_source_volume(self, source_id, level):
+        if self._shutting_down:
+            return False
         if source_id not in self._sources:
             return False
         level = sources_module.level(level)
@@ -1308,6 +1399,8 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         self.set_source_volume(source_id, level)
 
     def _set_source_muted(self, source_id, muted, *, hardware=True):
+        if self._shutting_down:
+            return
         source = self._sources.get(source_id)
         if source is None:
             return None
@@ -1402,6 +1495,8 @@ class WaveXLRWindow(Adw.ApplicationWindow):
             self.switch_group(sources_module.group(source))
 
     def _on_group_sources_clicked(self, _matrix, dragged_id, target_id):
+        if self._shutting_down:
+            return
         if dragged_id == target_id or dragged_id not in self._sources or target_id not in self._sources:
             return
         target = self._sources[target_id]
@@ -1413,6 +1508,8 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         self._set_source_muted(target_id, False)
 
     def set_cell_volume(self, source_id, mix_id, volume):
+        if self._shutting_down:
+            return False
         if source_id not in self._sources or mix_id not in self._mixes:
             return False
         volume = sources_module.level(volume)
@@ -1423,6 +1520,8 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         return True
 
     def toggle_cell_mute(self, source_id, mix_id):
+        if self._shutting_down:
+            return
         if source_id not in self._sources or mix_id not in self._mixes:
             return None
         state = self.mixer.get_cell(source_id, mix_id)
@@ -1438,6 +1537,8 @@ class WaveXLRWindow(Adw.ApplicationWindow):
             GLib.source_remove(timer)
 
     def _set_source_fx(self, source_id, settings):
+        if self._shutting_down:
+            return
         source = self._sources.get(source_id)
         if source is None or sources_module.kind(source) != sources_module.KIND_DEVICE:
             raise ValueError("Effects require a capture source")
@@ -1449,6 +1550,8 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         self._push_remote_state()
 
     def _on_source_fx_changed(self, row, source_id):
+        if self._shutting_down:
+            return
         self._cancel_fx_edit(source_id)
         settings = row.fx_settings()
         def apply():
@@ -1485,6 +1588,8 @@ class WaveXLRWindow(Adw.ApplicationWindow):
                 session["dialog"].close()
 
     def _on_fx_autotune(self, _row, source_id):
+        if self._shutting_down:
+            return
         if self._calibration is not None:
             return
         source = self._sources.get(source_id)
@@ -1628,6 +1733,8 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         return result
 
     def save_scene(self, name):
+        if self._shutting_down:
+            return
         if not name.strip():
             raise ValueError("A scene needs a name")
         payload = self.mixer.scene_state()
@@ -1656,6 +1763,8 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         return jobs, ["hardware " + key for key in hardware if key not in used]
 
     def apply_scene(self, sid):
+        if self._shutting_down:
+            return
         scene = scenes_module.load().get(sid)
         if scene is None:
             raise KeyError("Unknown scene: " + sid)
@@ -1742,6 +1851,8 @@ class WaveXLRWindow(Adw.ApplicationWindow):
                 lambda error, device=dev: self._on_device_error(device, error), device=dev)
 
     def delete_scene(self, sid):
+        if self._shutting_down:
+            return
         removed = scenes_module.remove(sid)
         self._rebuild_scene_menu()
         return removed
@@ -1775,6 +1886,8 @@ class WaveXLRWindow(Adw.ApplicationWindow):
             action.set_state(GLib.Variant("s", json.dumps(names)))
 
     def prompt_save_scene(self):
+        if self._shutting_down:
+            return
         dialog = Adw.AlertDialog(heading="Save Scene",
             body="Save trims, sends, mutes, outputs, masters and cached device levels. "
                  "Phantom power is excluded. Saving the same name replaces it.")
@@ -1823,6 +1936,13 @@ class WaveXLRApp(Adw.Application):
         self._window = None
         self._start_hidden = False
         self._tray = None
+        self._setup_window = None
+        self._setup_return = None
+        self._uninstall_dialog = None
+        self._uninstall_pending = False
+        self._uninstall_busy = False
+        self._uninstall_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="openwave-uninstall")
         self._register_remote_actions()
         self.add_main_option(
             "hide", 0, GLib.OptionFlags.NONE, GLib.OptionArg.NONE,
@@ -1859,9 +1979,86 @@ class WaveXLRApp(Adw.Application):
             # org.gtk.Actions.SetState.
             action.connect("change-state", lambda *_: None)
             self.add_action(action)
+        action = Gio.SimpleAction.new("uninstall", None)
+        action.connect("activate", lambda *_: self.show_uninstall())
+        self.add_action(action)
+        action = Gio.SimpleAction.new_stateful(
+            "prepare-uninstall", GLib.VariantType.new("s"), GLib.Variant("s", "idle"))
+        action.connect("activate", self._prepare_uninstall_requested)
+        action.connect("change-state", lambda *_: None)
+        self.add_action(action)
+
+    def uninstall_async(self, operation, done, failed):
+        """The uninstall executor must outlive the device executors it drains."""
+        future = self._uninstall_executor.submit(operation)
+
+        def dispatch(callback, value):
+            callback(value)
+            return False
+
+        def finished(completed):
+            try:
+                value = completed.result()
+            except Exception as error:
+                GLib.idle_add(dispatch, failed, error)
+            else:
+                GLib.idle_add(dispatch, done, value)
+
+        future.add_done_callback(finished)
+
+    def show_uninstall(self):
+        if self._uninstall_dialog is not None:
+            self._uninstall_dialog.present()
+            return
+        if self._uninstall_pending:
+            return
+        from .uninstall_dialog import UninstallDialog
+        self._uninstall_dialog = UninstallDialog(self)
+        self._uninstall_dialog.present()
+
+    def prepare_uninstall(self):
+        """Called on GTK only after explicit GUI or same-install CLI acceptance."""
+        if not self._uninstall_pending:
+            self._uninstall_pending = True
+            if self._window is not None:
+                self._window._save_ui_state()
+        if self._window is not None:
+            self._window.prepare_shutdown()
+        if self._setup_window is not None:
+            self._setup_window.set_sensitive(False)
+
+    def drain_uninstall(self):
+        if self._window is not None:
+            self._window.drain_shutdown()
+
+    def _prepare_uninstall_requested(self, action, parameter):
+        expected = parameter.unpack()
+        if (not os.path.isabs(expected) or expected != os.path.realpath(expected)
+                or expected != os.path.realpath(os.path.dirname(__file__))):
+            action.set_state(GLib.Variant("s", "error:Different OpenWave installation."))
+            return
+        if self._uninstall_busy or self._uninstall_dialog is not None:
+            action.set_state(GLib.Variant("s", "error:An uninstall dialog or operation is already open."))
+            return
+        action.set_state(GLib.Variant("s", "stopping"))
+        self._uninstall_busy = True
+
+        def failed(error):
+            self._uninstall_busy = False
+            action.set_state(GLib.Variant("s", "error:" + str(error)))
+            if self._window is not None:
+                self._window._show_error("Unable to stop OpenWave",
+                    str(error) + "\nRouting may be stopped. Retry removal or close OpenWave.")
+
+        try:
+            self.prepare_uninstall()
+        except Exception as error:
+            failed(error)
+            return
+        self.uninstall_async(self.drain_uninstall, lambda _: self.quit(), failed)
 
     def _remote_activate(self, action, parameter, method):
-        if self._window is None or self._window._shutting_down:
+        if self._uninstall_pending or self._window is None or self._window._shutting_down:
             return
         try:
             value = parameter.unpack()
@@ -1892,6 +2089,14 @@ class WaveXLRApp(Adw.Application):
         return 0
 
     def do_activate(self):
+        if self._uninstall_dialog is not None:
+            self._uninstall_dialog.present()
+            return
+        if self._uninstall_pending:
+            return
+        if self._setup_window is not None:
+            self._setup_window.present()
+            return
         if not self._window:
             self._load_css()
             # The user unit is OpenWave-owned state, so keep it aligned with
@@ -1941,16 +2146,20 @@ class WaveXLRApp(Adw.Application):
         if self._tray is not None:
             self._tray.unregister()
             self._tray = None
-        if self._window is not None:
+        if self._window is not None and not self._uninstall_pending:
             window = self._window
             window._save_ui_state()
             window.shutdown()
-            window.mixer.stop()
-            window.meter.stop_all()
+        self._uninstall_executor.shutdown(wait=False, cancel_futures=True)
         Adw.Application.do_shutdown(self)
 
 
     def _on_close_request(self, window):
+        if self._uninstall_pending:
+            if self._uninstall_dialog is not None:
+                self._uninstall_dialog.present()
+                return True
+            return self._uninstall_busy
         if self._tray:
             window.set_visible(False)
             return True  # prevent destroy, keep running in tray
@@ -1967,11 +2176,17 @@ class WaveXLRApp(Adw.Application):
 
 
     def _toggle_mute(self):
+        if self._uninstall_pending:
+            return
         if self._window and self._window.dev.connected:
             current = self._window._last_state and self._window._last_state.get("mute", False)
             self._window._device_async("set_mute", not current)
 
     def _quit_app(self):
+        if self._uninstall_busy:
+            if self._uninstall_dialog is not None:
+                self._uninstall_dialog.present()
+            return
         if self._tray is not None:
             self.release()
         self.quit()
@@ -1982,52 +2197,90 @@ class WaveXLRApp(Adw.Application):
             self._window.present()
 
     def _show_setup_dialog(self):
+        self._setup_return = self._show_setup_dialog
         dialog = Adw.AlertDialog(
             heading="First-Time Setup",
             body="OpenWave needs to configure USB permissions and install the audio service.\n\nYou may be prompted for your password.",
         )
         dialog.add_response("cancel", "Cancel")
+        dialog.add_response("uninstall", "Uninstall OpenWave…")
         dialog.add_response("setup", "Set Up")
         dialog.set_response_appearance("setup", Adw.ResponseAppearance.SUGGESTED)
         dialog.set_default_response("setup")
 
         tmp_win = Adw.ApplicationWindow(application=self)
+        self._setup_window = tmp_win
         tmp_win.present()
 
         dialog.choose(tmp_win, None, self._on_setup_response, tmp_win)
 
     def _on_setup_response(self, dialog, result, tmp_win):
         response = dialog.choose_finish(result)
+        if self._uninstall_pending:
+            return
+        if response == "uninstall":
+            self.show_uninstall()
+            return
+        self._setup_window = None
         tmp_win.close()
-
         if response != "setup":
             self.quit()
             return
-
         success, message = setup.run_setup()
         if success:
-            replug_dialog = Adw.AlertDialog(
-                heading="Setup Complete",
-                body=f"{message}.\n\nPlease replug your Elgato Wave device, then click Continue.",
-            )
-            replug_dialog.add_response("continue", "Continue")
-            replug_dialog.set_default_response("continue")
-
-            tmp_win2 = Adw.ApplicationWindow(application=self)
-            tmp_win2.present()
-            replug_dialog.choose(tmp_win2, None, self._on_replug_done, tmp_win2)
+            self._show_replug_dialog(message)
         else:
-            err_dialog = Adw.AlertDialog(
-                heading="Setup Failed",
-                body=message,
-            )
-            err_dialog.add_response("ok", "OK")
-            err_win = Adw.ApplicationWindow(application=self)
-            err_win.present()
-            err_dialog.choose(err_win, None, lambda d, r, w: (w.close(), self.quit()), err_win)
+            self._show_setup_error(message)
+
+    def _show_replug_dialog(self, message):
+        self._setup_return = lambda: self._show_replug_dialog(message)
+        dialog = Adw.AlertDialog(
+            heading="Setup Complete",
+            body=f"{message}.\n\nPlease replug your Elgato Wave device, then click Continue.",
+        )
+        dialog.add_response("continue", "Continue")
+        dialog.add_response("uninstall", "Uninstall OpenWave…")
+        dialog.set_default_response("continue")
+        window = Adw.ApplicationWindow(application=self)
+        self._setup_window = window
+        window.present()
+        dialog.choose(window, None, self._on_replug_done, window)
+
+    def _show_setup_error(self, message):
+        self._setup_return = lambda: self._show_setup_error(message)
+        dialog = Adw.AlertDialog(heading="Setup Failed", body=message)
+        dialog.add_response("ok", "OK")
+        dialog.add_response("uninstall", "Uninstall OpenWave…")
+        window = Adw.ApplicationWindow(application=self)
+        self._setup_window = window
+        window.present()
+        dialog.choose(window, None, self._on_setup_error_response, window)
+
+    def resume_setup(self):
+        resume = self._setup_return or self._show_setup_dialog
+        if self._setup_window is not None:
+            self._setup_window.destroy()
+            self._setup_window = None
+        resume()
+
+    def _on_setup_error_response(self, dialog, result, window):
+        response = dialog.choose_finish(result)
+        if self._uninstall_pending:
+            return
+        if response == "uninstall":
+            self.show_uninstall()
+            return
+        self._setup_window = None
+        window.close()
+        self.quit()
 
     def _on_replug_done(self, dialog, result, tmp_win):
-        dialog.choose_finish(result)
+        if self._uninstall_pending:
+            return
+        if dialog.choose_finish(result) == "uninstall":
+            self.show_uninstall()
+            return
+        self._setup_window = None
         tmp_win.close()
         win = WaveXLRWindow(application=self)
         self._window = win
@@ -2039,7 +2292,8 @@ class WaveXLRApp(Adw.Application):
             self._tray.set_state(bool(window._devs),
                 hardware_muted=any(state["mute"] for state in window._device_states.values()),
                 row_muted=window.capture_rows_muted(),
-                display_name=window.dev.profile.display_name if window.dev.profile else None)
+                display_name=window.dev.profile.display_name if window.dev.profile else None,
+                icon_color=window.tray_icon_color)
 
 
 
