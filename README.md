@@ -10,11 +10,15 @@ Linux control application for **Elgato Wave** audio devices — the **Wave XLR**
 | XLR Dock (`00a6` variant) | `0fd9:00a6` | Gain, mute, 48 V phantom power, headphone volume, low impedance mode |
 | Wave:3 | `0fd9:0070` | Gain, mute, headphone volume, monitor mix |
 
+The similarly named `0fd9:00c7` Dock variant is unverified and is not enabled.
+
 ## Features
 
 - **Microphone controls** — Gain, mute (syncs with hardware button), and profile-gated 48 V phantom power
 - **Headphone controls** — Volume (syncs with hardware knob), low impedance mode
 - **Hardware sync** — 10 Hz polling keeps the app in sync with physical controls
+- **Multiple devices** — Every supported unit is opened and polled independently, including two of the same model. The sidebar selects a device by serial or USB bus/address; each has its own serialized control worker.
+- **Hotplug** — Adding or removing a device preserves the other connected units. The capture daemon maintains one keepalive per Wave input.
 - **System integration** — Mute and HP volume sync bidirectionally with PipeWire/ALSA
 - **Audio capture fix** — Starts capture before playback, keeps it pinned while running, and tears it down after the audio graph so Wave firmware survives warm reboots
 - **System tray** — Runs in background with tray icon, mute from tray menu
