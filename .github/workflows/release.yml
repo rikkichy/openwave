@@ -108,7 +108,7 @@ jobs:
           useradd -m builder
           chown -R builder:builder aur-repo
           RECIPE_DIR=$(realpath aur-repo)
-          runuser -u builder -- bash -c 'cd "$1" && makepkg --printsrcinfo' bash "$RECIPE_DIR" > aur-repo/.SRCINFO
+          (cd aur-repo && runuser -u builder -- makepkg --printsrcinfo) > aur-repo/.SRCINFO
           git -C aur-repo -c safe.directory="$RECIPE_DIR" config user.name "$AUR_USERNAME"
           git -C aur-repo -c safe.directory="$RECIPE_DIR" config user.email "$AUR_EMAIL"
           git -C aur-repo -c safe.directory="$RECIPE_DIR" add PKGBUILD .SRCINFO

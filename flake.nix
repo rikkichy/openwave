@@ -72,7 +72,7 @@
                 --prefix PYTHONPATH : $out/${sitePkgs} \
                 --prefix LD_LIBRARY_PATH : ${usbLibs} \
                 --prefix PATH : ${runtimeBins} \
-                --prefix LADSPA_PATH : ${pkgs.swh-plugins}/lib/ladspa \
+                --prefix LADSPA_PATH : ${pkgs.ladspaPlugins}/lib/ladspa \
                 --prefix XDG_DATA_DIRS : ${pkgs.adwaita-icon-theme}/share \
                 "''${gappsWrapperArgs[@]}"
 
@@ -82,7 +82,7 @@
                   --prefix PYTHONPATH : $out/${sitePkgs} \
                   --prefix LD_LIBRARY_PATH : ${usbLibs} \
                   --prefix PATH : ${runtimeBins} \
-                  --prefix LADSPA_PATH : ${pkgs.swh-plugins}/lib/ladspa
+                  --prefix LADSPA_PATH : ${pkgs.ladspaPlugins}/lib/ladspa
               done
             '';
 

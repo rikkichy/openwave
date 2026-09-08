@@ -193,12 +193,14 @@ def collect_pipewire(full=False):
 
 
 def collect_configs(full=False):
+    from . import mixer, mixes, scenes, sources
     lines = []
     paths = {
-        "sources.json": os.path.expanduser("~/.config/openwave/sources.json"),
-        "mixdefs.json": os.path.expanduser("~/.config/openwave/mixdefs.json"),
-        "mixes.json": os.path.expanduser("~/.config/openwave/mixes.json"),
-        "ui-state.json": os.path.expanduser("~/.config/openwave/ui-state.json"),
+        "sources.json": sources.CONFIG_PATH,
+        "mixdefs.json": mixes.CONFIG_PATH,
+        "mixes.json": mixer.CONFIG_PATH,
+        "scenes.json": scenes.CONFIG_PATH,
+        "ui-state.json": os.path.join(os.path.dirname(sources.CONFIG_PATH), "ui-state.json"),
     }
     for name, path in paths.items():
         if not os.path.exists(path):
