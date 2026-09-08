@@ -318,6 +318,39 @@ def _alsa_hp_to_fw(alsa_hp, scale):
     return int(db * scale)
 
 
+# PipeWire's ALSA device.serial is udev ID_SERIAL: manufacturer_product_serial.
+# These are the supported units' udev prefixes, not node-name substring matches.
+_CAPTURE_SERIAL_PREFIXES = {
+    "wave_xlr": "Elgato_Systems_Elgato_Wave_XLR_",
+    "wave_xlr_mk2": "Elgato_Systems_Elgato_XLR_Dock_",
+    "wave3": "Elgato_Systems_Elgato_Wave_3_",
+}
+
+
+def device_for_capture(capture, devices):
+    """Map a capture only to one connected unit with an exact serial identity.
+
+    ALSA card indices are reusable and cannot establish physical identity.
+    Accept a bare firmware serial or its model's complete udev ID_SERIAL;
+    unknown formats and missing or duplicate identities use PipeWire instead.
+    """
+    serial = capture.get("serial")
+    if not isinstance(serial, str) or not serial:
+        return None
+    match = None
+    for dev in devices:
+        unit_serial = dev.info.get("serial")
+        if not dev.connected or not isinstance(unit_serial, str) or not unit_serial:
+            continue
+        prefix = _CAPTURE_SERIAL_PREFIXES.get(dev.profile.key)
+        if serial != unit_serial and (prefix is None or serial != prefix + unit_serial):
+            continue
+        if match is not None:
+            return None
+        match = dev
+    return match
+
+
 class WaveDevice:
     def __init__(self):
         self._handle = None
