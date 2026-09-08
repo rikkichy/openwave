@@ -6,6 +6,7 @@ each one with its (bus, addr) so callers can open them individually.
 """
 
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 from wavexlr import device
@@ -99,6 +100,59 @@ class DeviceReadiness(unittest.TestCase):
         with mock.patch.object(device._lib, "libusb_control_transfer", return_value=2):
             with self.assertRaises(RuntimeError):
                 dev.read_config()
+
+
+class CaptureIdentity(unittest.TestCase):
+    def _unit(self, serial, card="3", profile=WAVE_XLR_MK2):
+        return SimpleNamespace(
+            info={"serial": serial}, alsa_card=card, profile=profile, connected=True,
+        )
+
+    def test_reused_alsa_card_cannot_target_replacement_unit(self):
+        replacement = self._unit("UNIT_B")
+        stale_capture = {"alsa_card": "3", "serial": "UNIT_A"}
+        self.assertIsNone(device.device_for_capture(stale_capture, [replacement]))
+
+    def test_missing_capture_identity_leaves_pipewire_in_control(self):
+        unit = self._unit("UNIT_A")
+        self.assertIsNone(device.device_for_capture({"alsa_card": "3"}, [unit]))
+
+    def test_missing_hardware_identity_cannot_be_supplied_by_card(self):
+        unit = self._unit("")
+        capture = {"alsa_card": "3", "serial": "UNIT_A"}
+        self.assertIsNone(device.device_for_capture(capture, [unit]))
+
+    def test_exact_serial_follows_unit_not_recycled_card(self):
+        original = self._unit("UNIT_A", card="4")
+        replacement = self._unit("UNIT_B", card="3")
+        capture = {"alsa_card": "3", "serial": "UNIT_A"}
+        self.assertIs(device.device_for_capture(capture, [replacement, original]), original)
+
+    def test_complete_udev_identity_maps_same_unit(self):
+        unit = self._unit("A8A9A40411NOP9")
+        capture = {"serial": "Elgato_Systems_Elgato_XLR_Dock_A8A9A40411NOP9"}
+        self.assertIs(device.device_for_capture(capture, [unit]), unit)
+
+    def test_model_identity_cannot_be_replaced_by_serial_suffix(self):
+        unit = self._unit("UNIT_A", profile=WAVE3)
+        capture = {"alsa_card": "3", "serial": "Elgato_Systems_Elgato_XLR_Dock_UNIT_A"}
+        self.assertIsNone(device.device_for_capture(capture, [unit]))
+
+    def test_serial_substring_is_not_physical_identity(self):
+        unit = self._unit("UNIT_A")
+        capture = {"alsa_card": "3", "serial": "Elgato_Systems_Elgato_XLR_Dock_UNIT_AB"}
+        self.assertIsNone(device.device_for_capture(capture, [unit]))
+
+    def test_duplicate_identity_cannot_be_disambiguated_by_card(self):
+        first = self._unit("UNIT_A", card="3")
+        second = self._unit("UNIT_A", card="4")
+        capture = {"alsa_card": "3", "serial": "Elgato_Systems_Elgato_XLR_Dock_UNIT_A"}
+        self.assertIsNone(device.device_for_capture(capture, [first, second]))
+
+    def test_disconnected_unit_is_not_a_hardware_target(self):
+        unit = self._unit("UNIT_A")
+        unit.connected = False
+        self.assertIsNone(device.device_for_capture({"serial": "UNIT_A"}, [unit]))
 
 
 if __name__ == "__main__":

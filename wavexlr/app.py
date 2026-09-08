@@ -10,7 +10,7 @@ import os
 import sys
 from concurrent.futures import ThreadPoolExecutor
 
-from .device import WaveDevice, DeviceUnresponsiveError, scan
+from .device import WaveDevice, DeviceUnresponsiveError, device_for_capture, scan
 from .audio import SOURCE_MATCHES
 from .meter import MeterMonitor
 from .mixer import Mixer, claim_streams, stream_matches, source_sink_name, OUTPUT_AUTO, OUTPUT_NONE
@@ -1307,10 +1307,7 @@ class WaveXLRWindow(Adw.ApplicationWindow):
                         if item["name"] == source.get("node_name")), None)
         if capture is None:
             return None
-        candidates = [dev for dev in self._devs if
-            (capture.get("alsa_card") is not None and str(capture["alsa_card"]) == str(dev.alsa_card))
-            or (capture.get("serial") and capture["serial"] == dev.info.get("serial"))]
-        return candidates[0] if len(candidates) == 1 else None
+        return device_for_capture(capture, self._devs)
 
     def _sync_hw_mute(self, source, muted):
         if sources_module.kind(source) != sources_module.KIND_DEVICE:
