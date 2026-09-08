@@ -364,9 +364,11 @@ class HealthMonitor:
             return
         captures, sinks = graph
         for gone in self._known_captures - set(captures):
-            self.glitch.forget(gone)
+            # Profile cycling and graph reconstruction can temporarily remove
+            # the same node. Absence is not proof that its incident ended.
+            self.glitch.pause(gone)
         for gone in self._known_sinks - set(sinks):
-            self.stall.forget(gone)
+            self.stall.observe(gone, False, None, None, now)
         self._known_captures = set(captures)
         self._known_sinks = set(sinks)
         if captures:

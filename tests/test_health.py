@@ -288,8 +288,12 @@ class MonitorBehavior(unittest.TestCase):
         patcher = mock.patch.object(health.recovery, "card_name_for", return_value="alsa_card.dock")
         patcher.start()
         self.addCleanup(patcher.stop)
-        self.cycle = self.enterContext(mock.patch.object(health.recovery, "cycle_card"))
-        self.recycle = self.enterContext(mock.patch.object(health, "recycle_sink"))
+        patcher = mock.patch.object(health.recovery, "cycle_card")
+        self.cycle = patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(health, "recycle_sink")
+        self.recycle = patcher.start()
+        self.addCleanup(patcher.stop)
 
     def feed(self, monitor, counts, start=0):
         for index, count in enumerate(counts):
@@ -336,6 +340,43 @@ class MonitorBehavior(unittest.TestCase):
         self.sample_source_mutes.return_value = {DOCK: False}
         self.feed(monitor, [1380, 1610, 1840], 500)
         self.assertEqual(self.cycle.call_count, 2)
+
+    def test_valid_graph_omission_does_not_refill_either_remedy_budget(self):
+        monitor = health.HealthMonitor(auto_recover=True)
+        self.feed(monitor, [0, 230, 460, 690], 0)
+        self.assertEqual(self.cycle.call_count, 2)
+        self.assertEqual(self.recycle.call_count, 2)
+        self.snapshot_graph.return_value = ({}, {})
+        monitor.check_once(300)
+        self.snapshot_graph.return_value = self.graph
+        # A recreated counter starts at zero; no clean period has occurred.
+        self.feed(monitor, [0, 230, 460, 690], 400)
+        self.assertEqual(self.cycle.call_count, 2)
+        self.assertEqual(self.recycle.call_count, 2)
+
+    def test_valid_graph_omission_preserves_both_remedy_cooldowns(self):
+        monitor = health.HealthMonitor(auto_recover=True)
+
+        def sample(now, count):
+            with mock.patch.object(health, "sample_xruns", return_value={DOCK: count}):
+                monitor.check_once(now)
+
+        sample(0, 0)
+        sample(10, 230)
+        sample(20, 460)
+        self.assertEqual(self.cycle.call_count, 1)
+        self.assertEqual(self.recycle.call_count, 1)
+        self.snapshot_graph.return_value = ({}, {})
+        monitor.check_once(21)
+        self.snapshot_graph.return_value = self.graph
+        sample(22, 0)
+        sample(23, 230)
+        sample(24, 460)
+        self.assertEqual(self.cycle.call_count, 1)
+        self.assertEqual(self.recycle.call_count, 1)
+        sample(80, 690)
+        self.assertEqual(self.cycle.call_count, 2)
+        self.assertEqual(self.recycle.call_count, 2)
 
     def test_stop_cancels_and_reaps_a_blocked_sampler_before_returning(self):
         entered = threading.Event()
