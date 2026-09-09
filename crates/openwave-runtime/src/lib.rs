@@ -1,0 +1,21 @@
+pub mod audio;
+pub mod calibration;
+pub mod controller;
+pub mod desktop;
+pub mod device;
+pub mod diag;
+pub mod health;
+pub mod installation;
+pub mod meter;
+pub mod mixer;
+pub mod paths;
+pub mod probe;
+pub mod process;
+pub mod recovery;
+pub mod release;
+pub mod service;
+pub mod setup;
+pub mod store;
+pub mod uninstall;
+
+pub use openwave_core::VERSION;

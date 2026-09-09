@@ -1,0 +1,21 @@
+[package]
+name = "openwave-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+openwave-core.workspace = true
+openwave-runtime.workspace = true
+gtk.workspace = true
+adw.workspace = true
+glib.workspace = true
+gio.workspace = true
+serde_json.workspace = true
+indexmap.workspace = true
+async-channel.workspace = true
+clap.workspace = true
+log.workspace = true
+env_logger.workspace = true

@@ -1,19 +1,27 @@
 # Maintainer: rikkichy
-# packaging/build-release.sh pins version/source/checksum for the published
-# AUR recipe. In a checkout, this recipe builds the local source tree.
+# Use the prepared, vendored source archive from packaging/build-release.sh.
+# render-aur replaces only pkgver, source, sha256sums and _srcdir below.
 pkgname=openwave
 pkgver=$(cat "${startdir:-.}/VERSION")
 pkgrel=1
 pkgdesc="Linux control application for Elgato Wave hardware and PipeWire mixing"
-arch=('any')
+arch=('x86_64')
 url="https://github.com/rikkichy/openwave"
 license=('MIT')
-depends=('python' 'python-gobject' 'gtk4' 'libadwaita>=1.5' 'adwaita-icon-theme' 'libusb' 'pipewire' 'wireplumber' 'alsa-utils' 'libpulse' 'swh-plugins' 'polkit')
-makedepends=('make')
-source=()
-sha256sums=()
+depends=('gtk4>=4.14' 'libadwaita>=1.5' 'adwaita-icon-theme' 'libusb' 'pipewire' 'wireplumber' 'alsa-utils' 'libpulse' 'swh-plugins' 'polkit')
+makedepends=('make' 'pkgconf' 'rust>=1.98.1' 'clang')
+source=("openwave-$pkgver.tar.gz")
+sha256sums=('SKIP')
+_srcdir="openwave-$pkgver"
+
+build() {
+    cd "$srcdir/$_srcdir"
+    export CARGO_NET_OFFLINE=true
+    make build CARGO_BUILD_FLAGS='--release --frozen --offline --workspace --bins'
+}
 
 package() {
-    cd "$startdir"
-    make install DESTDIR="$pkgdir" PREFIX=/usr PYTHON=python3 INSTALL_METHOD=arch
+    cd "$srcdir/$_srcdir"
+    make install DESTDIR="$pkgdir" PREFIX=/usr INSTALL_METHOD=arch \
+        CARGO_BUILD_FLAGS='--release --frozen --offline --workspace --bins'
 }

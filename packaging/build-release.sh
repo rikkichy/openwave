@@ -1,69 +1,86 @@
 #!/bin/bash
-# Requires Debian tools, rpm, Python, GTK runtime, dbus-run-session and Xvfb.
-# Optional first argument is an exact tag, checked against VERSION and HEAD.
+# Prepare one source archive. Payload compilation and publication are separate.
 set -euo pipefail
-ROOT=$(git rev-parse --show-toplevel)
-cd "$ROOT"
-if [[ $# -gt 0 ]]; then
-    V=$(python3 packaging/version.py --tag "$1")
-    [[ $(git rev-parse "$1^{commit}") == $(git rev-parse HEAD) ]]
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+TAG= SNAPSHOT= OUT=
+fail() { printf '%s\n' "$*" >&2; exit 2; }
+while (($#)); do
+    case "$1" in
+        --snapshot-dir) (($# >= 2)) || fail 'missing snapshot directory'; SNAPSHOT=$2; shift 2 ;;
+        --output-dir) (($# >= 2)) || fail 'missing output directory'; OUT=$2; shift 2 ;;
+        --prepare-only) shift ;;
+        v*) [[ -z "$TAG" ]] || fail 'only one tag is accepted'; TAG=$1; shift ;;
+        *) fail "unknown argument: $1" ;;
+    esac
+done
+[[ $(id -u) != 0 ]] || fail 'Build release sources as an ordinary build user, not root.'
+[[ $(rustc --version) == 'rustc 1.98.1 '* ]] || fail 'Rust 1.98.1 is required'
+if [[ -n "$SNAPSHOT" ]]; then
+    [[ -z "$TAG" && -n "$OUT" ]] || fail 'snapshot mode requires --output-dir and forbids tags'
+    SNAPSHOT=$(realpath -- "$SNAPSHOT")
+    [[ -d "$SNAPSHOT" ]] || fail 'snapshot directory is missing'
+    MODE=snapshot
 else
-    V=$(python3 packaging/version.py)
+    [[ -n "$TAG" ]] || fail 'normal release preparation requires exact vMAJOR.MINOR.PATCH tag'
+    [[ $(git -C "$ROOT" rev-parse "$TAG^{commit}") == $(git -C "$ROOT" rev-parse HEAD) ]] || fail 'tag must identify HEAD'
+    [[ -z $(git -C "$ROOT" status --porcelain --untracked-files=normal) ]] || fail 'tagged release requires a clean source checkout'
+    MODE=tag
 fi
-OUT="$ROOT/dist"
-mkdir -p "$OUT"
-# Refuse to mix this build with artifacts left by a different run.
-shopt -s nullglob
-artifacts=("$OUT"/*)
-((${#artifacts[@]} == 0)) || { echo 'dist must be empty' >&2; exit 1; }
+OUT=${OUT:-"$ROOT/dist/source"}
+mkdir -p -- "$OUT"
+OUT=$(realpath -- "$OUT")
+shopt -s nullglob dotglob
+entries=("$OUT"/*)
+((${#entries[@]} == 0)) || fail 'output directory must be empty'
+if [[ -n "$SNAPSHOT" ]]; then
+    [[ "$OUT/" != "$SNAPSHOT/"* ]] || fail 'snapshot output must be outside the input tree'
+fi
 WORK=$(mktemp -d)
-trap 'rm -rf "$WORK"' EXIT
+trap 'rm -rf -- "$WORK"' EXIT
+mkdir "$WORK/source"
+if [[ "$MODE" == tag ]]; then
+    git -C "$ROOT" archive "$TAG" | tar -xf - -C "$WORK/source"
+    COMMIT=$(git -C "$ROOT" rev-parse "$TAG^{commit}")
+else
+    # Explicit input may contain current untracked rewrite sources, but never
+    # private guidance, credentials, build outputs, Cargo caches or VCS state.
+    tar -C "$SNAPSHOT" --exclude=.git --exclude=.omp --exclude=.env --exclude='.env.*' \
+        --exclude=AGENTS.md --exclude=CLAUDE.md --exclude=.cursorrules \
+        --exclude=target --exclude=dist --exclude=.direnv --exclude=result \
+        --exclude=__pycache__ --exclude='.pytest_cache' --exclude='.cargo/registry' \
+        --exclude='.cargo/git' --exclude='.cargo/.package-cache*' -cf - . | tar -xf - -C "$WORK/source"
+    COMMIT=uncommitted-snapshot
+fi
+cd "$WORK/source"
+# Bootstrap the GTK-free utility from the exact staged inputs and locked graph.
+# This is source preparation, the only phase allowed to fetch locked crates.
+export CARGO_TARGET_DIR="$WORK/bootstrap-target"
+cargo build --locked -p openwave-runtime --bin openwave-maintenance
+HELPER="$CARGO_TARGET_DIR/debug/openwave-maintenance"
+if [[ "$MODE" == tag ]]; then
+    V=$("$HELPER" version --file VERSION --tag "$TAG")
+else
+    V=$("$HELPER" version --file VERSION)
+fi
+[[ ! -e vendor ]] || fail 'input already contains vendor; provide an unprepared source tree'
+# Cargo discovers the existing project configuration. Its emitted replacement
+# is semantically merged only in this staging tree, preserving target settings.
+cargo vendor --locked --versioned-dirs vendor > "$WORK/vendor-config.toml"
+mkdir -p .cargo
+if [[ -e .cargo/config && ! -e .cargo/config.toml ]]; then
+    mv .cargo/config .cargo/config.toml
+elif [[ -e .cargo/config ]]; then
+    fail 'both legacy .cargo/config and config.toml exist; resolve ambiguity first'
+fi
+"$HELPER" merge-vendor-config --existing .cargo/config.toml --emitted "$WORK/vendor-config.toml" --output .cargo/config.toml
+cd "$WORK"
+mv source "openwave-$V"
 SOURCE="openwave-$V.tar.gz"
-git archive --format=tar.gz --prefix="openwave-$V/" -o "$OUT/$SOURCE" HEAD
-tar -xzf "$OUT/$SOURCE" -C "$WORK"
-cd "$WORK/openwave-$V"
-[[ $(python3 packaging/version.py) == "$V" ]]
-STAGE="$WORK/deb"
-make install DESTDIR="$STAGE" PREFIX=/usr PYTHON=/usr/bin/python3 INSTALL_METHOD=deb
-# Exercise the installed launchers, not imports from the checkout.
-PYTHON=/usr/bin/python3 dbus-run-session -- xvfb-run -a sh packaging/smoke-install.sh "$STAGE/usr"
-mkdir -p "$STAGE/DEBIAN"
-cat > "$STAGE/DEBIAN/control" <<EOF
-Package: openwave
-Version: $V
-Section: sound
-Priority: optional
-Architecture: all
-Depends: python3 (>= 3.10), python3-gi, gir1.2-gtk-4.0, gir1.2-adw-1, libadwaita-1-0 (>= 1.5), adwaita-icon-theme, libusb-1.0-0, pipewire, pipewire-bin, wireplumber, alsa-utils, pulseaudio-utils, swh-plugins, pkexec
-Maintainer: rikkichy <rikkichy@users.noreply.github.com>
-Homepage: https://github.com/rikkichy/openwave
-Description: Elgato Wave control panel and PipeWire mixing matrix
- Route application and device sources to independent mixes and outputs.
-EOF
-dpkg-deb --build --root-owner-group "$STAGE" "$OUT/openwave_${V}_all.deb"
-RPMROOT="$WORK/rpmbuild"
-mkdir -p "$RPMROOT/SOURCES"
-cp "$OUT/$SOURCE" "$RPMROOT/SOURCES/"
-# Disable host distro Python byte-compilation: this is a noarch private tree,
-# interpreted on the target system, not against the release runner's Python.
-rpmbuild --define "_topdir $RPMROOT" --define "openwave_version $V" \
-    --define 'dist %{nil}' --define '__os_install_post %{nil}' \
-    -bb packaging/rpm/openwave.spec
-cp "$RPMROOT"/RPMS/noarch/openwave-*.rpm "$OUT/"
-# Generate a standalone, checksummed AUR recipe without changing the checkout.
-python3 - "$OUT" "$V" <<'PY'
-import hashlib
-from pathlib import Path
-import sys
-out, version = Path(sys.argv[1]), sys.argv[2]
-archive = f'openwave-{version}.tar.gz'
-checksum = hashlib.sha256((out / archive).read_bytes()).hexdigest()
-recipe = Path('PKGBUILD').read_text()
-recipe = recipe.replace('pkgver=$(cat "${startdir:-.}/VERSION")', f'pkgver={version}')
-recipe = recipe.replace('source=()', 'source=("https://github.com/rikkichy/openwave/releases/download/v$pkgver/openwave-$pkgver.tar.gz")')
-recipe = recipe.replace('sha256sums=()', f"sha256sums=('{checksum}')")
-recipe = recipe.replace('cd "$startdir"', 'cd "$srcdir/openwave-$pkgver"')
-(out / 'PKGBUILD').write_text(recipe)
-PY
-cd "$OUT"
-sha256sum "$SOURCE" openwave_*.deb openwave-*.rpm PKGBUILD > sha256sums.txt
+# Archive the whole prepared tree, including vendor/.cargo-checksum.json files.
+tar -czf "$OUT/$SOURCE" "openwave-$V"
+DIGEST=$(sha256sum "$OUT/$SOURCE"); DIGEST=${DIGEST%% *}
+"$HELPER" render-aur --version "$V" --sha256 "$DIGEST" --output "$OUT/PKGBUILD"
+printf '%s\n' "$V" > "$OUT/version.txt"
+printf 'mode=%s\ncommit=%s\ntag=%s\narchive=%s\nsha256=%s\n' "$MODE" "$COMMIT" "$TAG" "$SOURCE" "$DIGEST" > "$OUT/source-provenance.txt"
+(cd "$OUT" && sha256sum "$SOURCE" PKGBUILD version.txt source-provenance.txt > source.sha256)
+printf 'Prepared %s (%s); use build-native.sh then assemble-release.sh. No publication performed.\n' "$OUT/$SOURCE" "$MODE"

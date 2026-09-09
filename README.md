@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>Elgato Wave controls, native to Linux.</strong><br>
-  Built with Python, GTK4, and libadwaita.
+  Built with Rust, GTK4, and libadwaita.
 </p>
 
 <p align="center">
@@ -47,6 +47,7 @@ Controls are enabled by the device profile. Phantom power and low impedance mode
 ## Mixing
 
 - Add, rename, reorder or remove sources and mixes. Each source has a trim and each source-to-mix send has its own level/mute: effective send level is **trim × send**.
+- Saved source, send and master volumes keep Python's normalized `wpctl`/Pulse meaning. Existing values are not reinterpreted as linear PCM gain or rewritten during load.
 - Application streams are claimed by one source and moved into its intake, not copied alongside their original playback. A claimed application's zero sends mean silence; remove its binding or source to stop managing it.
 - Group alternative sources for exclusive switching. Unmuting one member mutes its peers; a group may also be entirely muted.
 - Choose an output per mix, or **Not monitored** for capture-only use. Personal defaults to Automatic; other mixes default to Not monitored. A missing explicitly selected output stays silent instead of moving sound to another device.
@@ -60,13 +61,13 @@ Keep a voice application's return audio out of the mix selected as its microphon
 
 ### Quick install
 
-On a supported mutable distribution, review the installer before running it. With `curl`, `git`, and `make` available:
+On a supported mutable distribution, review the installer before running it. Run as your login user, with `curl`, `git`, and `make` available:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/rikkichy/openwave/main/install.sh | sh
 ```
 
-The installer detects **Arch, Debian/Ubuntu, Fedora, openSUSE, or Void** and installs dependencies and application files. It uses root, sudo, doas or pkexec; the default prefix is `/usr/local`. **Do not run the GUI as root.**
+The installer supports **Arch, Debian/Ubuntu, Fedora, openSUSE, or Void** when the required library versions are available. It installs native dependencies and Rust **1.98.1**, then builds and stages the application as your login user. Only dependency installation and system-file copying request administrator authorization through sudo, doas or pkexec. The default prefix is `/usr/local`; final privileged copying uses a validated root-owned bootstrap, never an elevated Cargo build. **Do not run the installer or GUI as root, or use `sudo make install`.**
 
 ### Install from a checkout
 
@@ -82,16 +83,35 @@ For a packaging-style layout under `/usr`, use `PREFIX=/usr ./install.sh` instea
 make install PREFIX="$HOME/.local"
 ```
 
-`Makefile` supports `DESTDIR`, `PYTHON` and `SITEPKG`; the default module directory is `<prefix>/share/openwave/site-packages`.
+The native layout puts `openwave`, `openwave-daemon`, `openwave-diag` and `openwave-probe` in `<prefix>/bin`, the private `openwave-maintenance` helper in `<prefix>/libexec`, and assets plus the installation receipt in `<prefix>/share/openwave`. The helper is not a public command or a way to elevate a user-owned checkout.
+
+`Makefile` supports `PREFIX`, `DESTDIR`, `BINARY_DIR` and `CARGO_BUILD_FLAGS`. It builds missing binaries in `target/release` by default and checks their version against canonical `VERSION`. `DESTDIR` is a separate absolute staging root, not a runtime prefix. Package builders must record the appropriate `INSTALL_METHOD`; a manual receipt cannot override package-manager ownership.
+
+An existing installation is not blindly overwritten. The installer can retire a validated legacy application only after explicit confirmation, preserving settings and user integration. Ambiguous, modified or package-owned layouts require resolving the reported conflict first. Installation is not atomic: on interruption, retain the prepared inputs and follow the printed continuation instructions; never elevate a staged binary or an unverified bootstrap.
+
+### Build and run from source
+
+With [Rustup](https://rustup.rs/) and the native development dependencies below available, build as an ordinary user from the checkout root:
+
+```bash
+rustup toolchain install 1.98.1 --profile minimal
+cargo build --locked --workspace --bins
+./target/debug/openwave
+```
+
+`rust-toolchain.toml` pins Rust 1.98.1; `Cargo.lock` pins crate dependencies. Build **all workspace binaries**, not only the GUI: direct source runs need the sibling maintenance helper and daemon, as well as the checkout's assets and matching `VERSION`. Keep the checkout and build directory in place while a service refers to them. `make build` produces the release binaries instead. A Nix development environment is also available with `nix develop path:.`.
 
 ### Requirements
 
-- Python 3.10+, PyGObject, GTK4, libadwaita **1.5+**, and Adwaita icons.
+- GTK **4.14+**, libadwaita **1.5+**, and Adwaita icons.
+- Supported release target: **x86-64 Linux**. Native package, CI, Nix and experimental Flatpak release inputs use this target.
 - libusb 1.0 and ALSA utilities (`aplay`, `amixer`).
 - PipeWire tools: `pipewire`, `pw-cat`, `pw-cli`, `pw-dump`, `pw-link`, `pw-loopback` and `pw-top`.
 - WirePlumber/`wpctl` and PulseAudio client tools/`pactl`.
 - SWH LADSPA plugins: `swh-plugins` on Arch/Debian/Void; `ladspa-swh-plugins` on Fedora/openSUSE.
 - Polkit/`pkexec` for native first-run USB setup.
+- Source builds additionally need Rust **1.98.1**, a C compiler/linker, `pkg-config`, Make, and GTK4/libadwaita/libusb development headers. OpenWave has no Python runtime dependency.
+- GTK-free maintenance/release-source preparation still requires GLib/GIO and libusb development metadata (`libglib2.0-dev` and `libusb-1.0-0-dev` on Debian/Ubuntu).
 
 ### Nix
 
@@ -99,7 +119,7 @@ make install PREFIX="$HOME/.local"
 nix run github:rikkichy/openwave
 ```
 
-The flake exports `packages.<system>.openwave` and a default package for `x86_64-linux` and `aarch64-linux`. On NixOS, add the package to `services.udev.packages` for declarative USB permissions, as well as installing it for your user. Launchers carry runtime tool paths and the LADSPA search path. This describes the packaging contract, not validation of every target build.
+The flake exports `packages.x86_64-linux.openwave` and its default package. On NixOS, add the package to `services.udev.packages` for declarative USB permissions, as well as installing it for your user. Launchers carry runtime tool paths and the LADSPA search path. Building a package does not establish physical acceptance for every enabled device profile.
 
 ### Bazzite / Fedora Atomic
 
@@ -107,27 +127,21 @@ Use the [native host checkout or user-prefix installation](docs/install-bazzite.
 
 ### Flatpak (experimental)
 
-The manifest supports experimental **panel and routing** use. With GNOME Platform/SDK 49 and `flatpak-builder` installed:
+The experimental [Flatpak recipe](packaging/flatpak/com.github.openwave.yml) targets **panel and routing** use with GNOME Platform/SDK **50** and Rust **1.98.1**. The [build entrypoint](packaging/flatpak/build.sh) requires a prepared vendored release archive, its SHA-256, a native x86-64 runner and an empty output directory; a bare checkout is not the offline release input.
 
-```bash
-flatpak-builder --user --install --force-clean build-flatpak packaging/flatpak/com.github.openwave.yml
-flatpak run com.github.openwave
-```
-
-The sandbox does not install host udev rules, services or audio configuration, and does not restart host audio services. Configure those through the native host installation. Raw-device permission does not replace host USB permissions. This is a build recipe, not a claim that a Flatpak build or hardware run has passed; see [sandbox boundaries](docs/install-bazzite.md).
+This is a packaging route, not a claim of a published artifact or successful build/hardware run on every target. The sandbox does not install host udev rules, services or audio configuration, and does not restart host audio services. Configure those outside the sandbox. Raw-device permission does not replace host USB permissions; see [sandbox boundaries](docs/install-bazzite.md).
 
 ## Usage
 
-Launch an installed copy, inspect informational options, or run from a checkout:
+Launch an installed copy or inspect informational options:
 
 ```bash
 openwave
 openwave --help
 openwave --version               # no GTK, audio or USB startup
-python3 -m wavexlr               # from a checkout
 ```
 
-Native first-run setup offers USB permissions, user audio configuration and capture-keepalive service setup. Read the prompt before approving host changes: audio reconfiguration may interrupt active sessions. Reconnect the device when prompted.
+For source runs, use `./target/debug/openwave` after the complete build above. Native first-run setup offers USB permissions, per-user audio configuration and capture-keepalive service setup. USB permission changes require a trusted root-owned installed helper; source and user-prefix builds must use administrator-managed USB rules instead. Setup writes audio configuration for the next relevant audio-service start rather than restarting host PipeWire/WirePlumber. Review changes before interrupting an active session yourself, and reconnect the device when prompted.
 
 ### Run in the background
 
@@ -135,9 +149,20 @@ Native first-run setup offers USB permissions, user audio configuration and capt
 openwave --hide
 ```
 
-From a checkout, use `python3 -m wavexlr --hide`. A hidden launch requires a working tray host; without one, the window remains available.
+From a built checkout, use `./target/debug/openwave --hide`. A hidden launch requires a working tray host; without one, the window remains available.
 
 Open **Application menu → Settings → Tray icon color** to choose **White** (the default) or **Black** for your panel. The choice is saved across launches. When a connected microphone is muted, the tray icon turns **red**; after unmuting, it returns to your selected color. A disconnected device keeps the selected color, with its disconnected status shown in the tooltip.
+
+### Upgrade existing launchers
+
+New menu/autostart entries use a stable profile launcher when it is proven to start this installation. Entries from an earlier native build may instead contain that build's canonical executable path. Keep the previous installation available and inspect a confirmed handoff before deleting it or garbage-collecting its Nix generation:
+
+```sh
+openwave --migrate-launchers-from /absolute/previous/bin/openwave --dry-run
+openwave --migrate-launchers-from /absolute/previous/bin/openwave --yes
+```
+
+Use the exact old executable named by the entry; an older Nix entry may name `bin/.openwave-wrapped`. Select the new build in the recognized current profile (`~/.nix-profile` or the per-user/system Nix profile); invoking a versioned store binary directly does not create a stable launcher. Without `--yes`, mutation requires an interactive confirmation. Inspection starts no GUI, USB or audio workers. The handoff preserves login/hidden intent and rechecks the old installation and entry identities; foreign, package-managed, linked, changed or unproven entries remain protected. Missing previous authority is not inferred from launcher text. See [launcher and removal conflicts](docs/troubleshooting.md#installation-and-removal-conflicts).
 
 ### Start at login
 
@@ -187,9 +212,9 @@ Run this as your login user, **not with sudo**. Administrator permission is requ
 
 **Package-managed installations** retain their package files. OpenWave can clean up its own native integration, then displays the package-manager or Nix configuration instructions. Flatpak directs removal to the host and cannot remove native host integration. Externally managed symlinks and package-owned configuration are retained.
 
-Manual installs carry an exact installation inventory, so uninstalling does not require the original checkout. Identifiable legacy layouts are supported; ambiguous ownership or modified recorded files block deletion instead of guessing. Partial failures are reported with completed steps and a retry option. If application files were already partially removed, a private recovery bundle provides a printed retry command without requiring a checkout.
+Manual installs carry a bounded, hashed `install-manifest.json` receipt, so uninstalling does not require the original checkout. Identifiable legacy layouts are supported; ambiguous ownership or modified recorded files block deletion instead of guessing. Unrecorded siblings and symlink boundaries are preserved. Partial failure or cancellation reports completed steps; those steps are not rolled back. A private recovery bundle prints a confirmed retry command that works even after application files have been removed. Keep that bundle until recovery finishes; its record does not grant authority to delete changed or unrelated files.
 
-`make uninstall` is an explicit **application-files-only** compatibility/build target; it does not remove user integration or settings. Use the same `PREFIX`, `SITEPKG` and any staging `DESTDIR` used at installation.
+`make uninstall` explicitly confirms **application-files-only** removal. It does not remove user integration or settings, stop live workers, or elevate for system files. For a writable manual installation, stop its GUI and capture service first, then use the same `PREFIX` and any staging `DESTDIR` used at installation. It needs a built or installed maintenance helper (`BINARY_DIR` selects the build directory). Use the GUI/CLI uninstaller for live system installations; package-owned files remain the manager's responsibility.
 
 ## How it works
 
@@ -212,7 +237,7 @@ Supported models use `bRequest=0x85` to read and `bRequest=0x05` to write config
 |Knob / dial mode|`14`|`12`|
 |Low impedance mode|`33`|—|
 
-For Wave:3, dial mode values are `1` = gain, `2` = headphones, and `3` = mix. Per-model constants and capabilities live in [`wavexlr/profiles.py`](wavexlr/profiles.py). See [protocol documentation](docs/protocol.md) for scope and safe probing.
+For Wave:3, dial mode values are `1` = gain, `2` = headphones, and `3` = mix. Per-model constants and capabilities live in [`openwave-core/src/profiles.rs`](crates/openwave-core/src/profiles.rs). See [protocol documentation](docs/protocol.md) for scope and safe probing.
 </details>
 
 ### Device probing and diagnostics
@@ -220,8 +245,8 @@ For Wave:3, dial mode values are `1` = gain, `2` = headphones, and `3` = mix. Pe
 The engineer-only probe provides `dump`, `watch` and `poke`. **Quit OpenWave, including its tray, before vendor probing:** the device services vendor transfers from only one process at a time.
 
 ```bash
-openwave-probe --help            # installed launcher
-python3 -m wavexlr.probe --help   # from a checkout
+openwave-probe --help                # installed binary
+./target/debug/openwave-probe --help  # after the complete source build
 ```
 
 For ordinary problem reports, start with privacy-reduced diagnostics:
@@ -230,24 +255,22 @@ For ordinary problem reports, start with privacy-reduced diagnostics:
 openwave-diag -o openwave-diagnostics.txt
 ```
 
-Use `python3 -m wavexlr.diag` from a checkout. Native packages use a private Python module tree; system Python is not guaranteed to import `wavexlr` outside that checkout.
+From a built checkout, use `./target/debug/openwave-diag -o openwave-diagnostics.txt`. Reports include the native compiler/build target; no interpreter or module-path setup is needed.
 
 Diagnostics do not open USB vendor handles unless `--device` is supplied. `--full` adds private details, **not** USB permission. Close OpenWave before `--device`; review reports before posting to [the issue tracker](https://github.com/rikkichy/openwave/issues). See [diagnostic privacy](docs/troubleshooting.md).
 
 ## Architecture
 
-|Module|Responsibility|
+|Crate / files|Responsibility|
 |---|---|
-|[`device.py`](wavexlr/device.py), [`profiles.py`](wavexlr/profiles.py)|Raw libusb controls, exact physical identity and model-specific capabilities|
-|[`app.py`](wavexlr/app.py), [`scheduler.py`](wavexlr/scheduler.py)|GTK interface, polling and per-device control queues|
-|[`mixer.py`](wavexlr/mixer.py)|Worker-owned graph mutations, stream claims, sends, outputs and published captures|
-|[`sources.py`](wavexlr/sources.py), [`mixes.py`](wavexlr/mixes.py)|Stable source/mix definitions|
-|[`scenes.py`](wavexlr/scenes.py)|Safe level snapshots and serial-bound hardware recall|
-|[`effects.py`](wavexlr/effects.py), [`calibrate.py`](wavexlr/calibrate.py)|Validated DSP configuration and cancellable raw-input measurements|
-|[`meter.py`](wavexlr/meter.py), [`audio.py`](wavexlr/audio.py)|Bounded raw metering and capture keepalives|
-|[`health.py`](wavexlr/health.py), [`recovery.py`](wavexlr/recovery.py)|Observe-only health and bounded opt-in remedies|
-|[`daemon.py`](wavexlr/daemon.py), [`service.py`](wavexlr/service.py)|Headless entry point and service-manager integration|
-|[`setup.py`](wavexlr/setup.py), [`tray.py`](wavexlr/tray.py)|Native setup and StatusNotifierItem tray integration|
+|[`openwave-core`](crates/openwave-core/src): `profiles.rs`, `protocol.rs`|Enabled capabilities and validated USB configuration blocks|
+|[`openwave-core`](crates/openwave-core/src): `model.rs`, `routing.rs`, `scenes.rs`, `effects.rs`, `calibration.rs`, `health.rs`|Compatible state schemas, routing/scene rules, DSP and health policy|
+|[`openwave-runtime`](crates/openwave-runtime/src): `device.rs`, `controller.rs`, `controller/`|libusb ownership, serialized per-device work and state reconciliation|
+|[`openwave-runtime`](crates/openwave-runtime/src): `mixer.rs`, `audio.rs`, `meter.rs`, `calibration.rs`|Worker-owned graph, application claims, capture readiness, raw measurements and DSP routing|
+|[`openwave-runtime`](crates/openwave-runtime/src): `health.rs`, `recovery.rs`, `service.rs`, `bin/openwave-daemon.rs`|Observe-only health, opt-in bounded remedies and capture service|
+|[`openwave-runtime`](crates/openwave-runtime/src): `paths.rs`, `store.rs`, `installation.rs`, `uninstall.rs`, `setup.rs`|Assets/state, installation receipts, confirmed removal and native host setup|
+|[`openwave-runtime`](crates/openwave-runtime/src): `diag.rs`, `probe.rs`, `bin/`|Public diagnostic/probe binaries and private maintenance entrypoint|
+|[`openwave-desktop`](crates/openwave-desktop/src): `app.rs`, `actions.rs`, `ui/`, `tray.rs`, `icons.rs`|GTK/libadwaita interface, compatible session-bus actions and supplied StatusNotifierItem artwork|
 
 Detailed contracts: [architecture/state/actions](docs/ARCHITECTURE.md), [hardware scope](docs/hardware-support.md), and [installation boundaries](docs/install-bazzite.md).
 
