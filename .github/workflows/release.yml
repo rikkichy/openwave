@@ -3,6 +3,7 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # Manual runs rehearse the current source snapshot; they never publish.
   workflow_dispatch:
 
 permissions:
@@ -16,72 +17,153 @@ jobs:
   test:
     uses: ./.github/workflows/tests.yml
 
-  build:
+  source:
     needs: test
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+    if: github.repository == 'rikkichy/openwave'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Install native build and GTK smoke dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y rpm python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 adwaita-icon-theme libusb-1.0-0 xvfb xauth dbus-x11
-      - name: Build one version from one source archive
+          fetch-depth: 0
+      - name: Install GTK-free release utility dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libglib2.0-dev libusb-1.0-0-dev
+      - name: Install exact official toolchain
+        run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy
+      - name: Prepare one locked vendored source
         env:
           RELEASE_REF: ${{ github.ref }}
+          RELEASE_EVENT: ${{ github.event_name }}
         run: |
-          if [[ "$RELEASE_REF" == refs/tags/* ]]; then
-            bash packaging/build-release.sh "${RELEASE_REF#refs/tags/}"
+          if [[ "$RELEASE_EVENT" == push && "$RELEASE_REF" == refs/tags/* ]]; then
+            bash packaging/build-release.sh "${RELEASE_REF#refs/tags/}" --prepare-only --output-dir "$RUNNER_TEMP/source"
+          elif [[ "$RELEASE_EVENT" == workflow_dispatch ]]; then
+            mkdir "$RUNNER_TEMP/snapshot"
+            git archive HEAD | tar -xf - -C "$RUNNER_TEMP/snapshot"
+            bash packaging/build-release.sh --snapshot-dir "$RUNNER_TEMP/snapshot" --output-dir "$RUNNER_TEMP/source" --prepare-only
           else
-            bash packaging/build-release.sh
+            echo 'Unsupported release event' >&2
+            exit 2
           fi
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: prepared-source
+          path: ${{ runner.temp }}/source/*
+          if-no-files-found: error
+
+  native:
+    needs: source
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [ubuntu24.04, debian13, fedora43]
+        platform:
+          - runner: ubuntu-24.04
+            arch: x86_64
+    runs-on: ${{ matrix.platform.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: prepared-source
+          path: ${{ runner.temp }}/source
+      - name: Install exact official hosted toolchain
+        run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy
+      - name: Build against the pinned target distro userspace
+        env:
+          DISTRO: ${{ matrix.distro }}
+          ARCH: ${{ matrix.platform.arch }}
+        run: |
+          cd "$RUNNER_TEMP/source"
+          sha256sum --check source.sha256
+          archives=(openwave-*.tar.gz)
+          [[ ${#archives[@]} == 1 ]]
+          digest=$(sha256sum "${archives[0]}"); digest=${digest%% *}
+          bash "$GITHUB_WORKSPACE/packaging/build-native.sh" \
+            --source-archive "$PWD/${archives[0]}" --sha256 "$digest" \
+            --distro "$DISTRO" --arch "$ARCH" --output-dir "$RUNNER_TEMP/native"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-${{ matrix.distro }}-${{ matrix.platform.arch }}
+          path: ${{ runner.temp }}/native/*
+          if-no-files-found: error
+
+  assemble:
+    needs: native
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: prepared-source
+          path: ${{ runner.temp }}/source
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: native-*
+          path: ${{ runner.temp }}/native-inputs
+          merge-multiple: false
+      - name: Verify provenance, reject collisions and assemble once
+        run: |
+          bash packaging/assemble-release.sh --source-dir "$RUNNER_TEMP/source" \
+            --input-dir "$RUNNER_TEMP/native-inputs" --output-dir "$RUNNER_TEMP/release"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-objects
-          path: dist/*
+          path: ${{ runner.temp }}/release/*
           if-no-files-found: error
 
   publish:
-    needs: build
+    needs: assemble
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && github.repository == 'rikkichy/openwave'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: release-objects
-      - name: Verify and attach every native artifact
+      - name: Verify and attach the assembled native release
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
+          set -euo pipefail
           sha256sum --check sha256sums.txt
+          [[ "$RELEASE_TAG" == "v$(cat version.txt)" ]]
+          grep -Fx 'mode=tag' source-provenance.txt
+          grep -Fx "tag=$RELEASE_TAG" source-provenance.txt
+          mapfile -t objects < release-objects
+          for object in "${objects[@]}"; do
+            [[ "$object" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ && -f "$object" && ! -L "$object" ]]
+          done
           gh release create "$RELEASE_TAG" --verify-tag \
             --repo rikkichy/openwave --title "OpenWave ${RELEASE_TAG#v}" \
-            --generate-notes openwave-*.tar.gz openwave_*.deb openwave-*.rpm PKGBUILD sha256sums.txt
+            --generate-notes "${objects[@]}"
 
   aur:
     needs: publish
-    if: vars.AUR_PUBLISH == 'true' && github.repository == 'rikkichy/openwave'
-    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && vars.AUR_PUBLISH == 'true' && github.repository == 'rikkichy/openwave'
+    runs-on: ubuntu-24.04
     container: archlinux:base-devel
     environment: aur
     timeout-minutes: 10
     steps:
       - name: Install AUR tools
         run: pacman -Syu --noconfirm git openssh
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: release-objects
       - name: Publish verified recipe to AUR only
         shell: bash
         env:
           AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
-          # One reviewed Ed25519 known_hosts entry, also checked against the
-          # fingerprint published at https://aur.archlinux.org/ (2026-09-08).
+          # Reviewed Ed25519 entry, checked against the official AUR fingerprint.
           AUR_KNOWN_HOSTS: ${{ secrets.AUR_KNOWN_HOSTS }}
           AUR_USERNAME: ${{ secrets.AUR_USERNAME }}
           AUR_EMAIL: ${{ secrets.AUR_EMAIL }}
@@ -93,11 +175,13 @@ jobs:
           : "${AUR_USERNAME:?AUR commit identity is required}"
           : "${AUR_EMAIL:?AUR commit email is required}"
           sha256sum --check sha256sums.txt
+          [[ "$RELEASE_TAG" == "v$(cat version.txt)" ]]
           SSH_DIR=$(mktemp -d)
           trap 'rm -rf "$SSH_DIR"' EXIT
           chmod 700 "$SSH_DIR"
           printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > "$SSH_DIR/key"
           printf '%s\n' "$AUR_KNOWN_HOSTS" > "$SSH_DIR/known_hosts"
+          unset AUR_SSH_PRIVATE_KEY AUR_KNOWN_HOSTS
           chmod 600 "$SSH_DIR/key" "$SSH_DIR/known_hosts"
           ssh-keygen -F aur.archlinux.org -f "$SSH_DIR/known_hosts" >/dev/null
           fingerprint=$(ssh-keygen -lf "$SSH_DIR/known_hosts" -E sha256 | cut -d ' ' -f 2)

@@ -2,3 +2,18 @@ __pycache__/
 *.pyc
 *.pyo
 .vscode/
+
+# Local agent guidance, environment activation, and harness state.
+/AGENTS.md
+/.omp/
+/.envrc
+/.direnv/
+
+# Native development and packaging outputs.
+/target/
+/build/
+/build-flatpak/
+/dist/
+/result
+/result-*
+/compile_commands.json
