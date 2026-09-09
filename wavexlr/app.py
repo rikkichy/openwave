@@ -583,12 +583,12 @@ class WaveXLRWindow(Adw.ApplicationWindow):
     def _on_poll_result(self, device, state):
         self._polling_devices.discard(device)
         self._device_failures[device] = 0
-        previous = self._device_states.get(device)
         self._device_states[device] = state
-        if previous is not None and previous["mute"] != state["mute"]:
-            for sid, source in list(self._sources.items()):
-                if self._device_for_source(source) is device:
-                    self._set_source_muted(sid, state["mute"], hardware=False)
+        # Fast toggles can return to the previous poll value while a row is stale.
+        # Reconcile against the row, not only against the last hardware edge.
+        for sid, source in list(self._sources.items()):
+            if source["muted"] != state["mute"] and self._device_for_source(source) is device:
+                self._set_source_muted(sid, state["mute"], hardware=False)
         if device is self.dev and state != self._last_state:
             self._apply_state(state)
         self._notify_tray()

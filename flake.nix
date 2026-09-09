@@ -6,7 +6,10 @@
   outputs =
     { self, nixpkgs }:
     let
-      forAllSystems = nixpkgs.lib.genAttrs [ "x86_64-linux" "aarch64-linux" ];
+      forAllSystems = nixpkgs.lib.genAttrs [
+        "x86_64-linux"
+        "aarch64-linux"
+      ];
     in
     {
       packages = forAllSystems (
@@ -98,5 +101,79 @@
           default = openwave;
         }
       );
+
+      devShells = forAllSystems (
+        system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+          python = pkgs.python3.withPackages (ps: [
+            ps.pygobject3
+            ps.debugpy
+          ]);
+          libraries = with pkgs; [
+            gtk4
+            libadwaita
+            libusb1
+            pipewire
+          ];
+          typelibPackages =
+            libraries
+            ++ (with pkgs; [
+              glib
+              gdk-pixbuf
+              pango
+              graphene
+              gobject-introspection
+            ]);
+        in
+        {
+          default = pkgs.mkShell {
+            name = "openwave-dev";
+            packages = with pkgs; [
+              rustc
+              cargo
+              rust-analyzer
+              rustfmt
+              clippy
+              llvmPackages.clang
+              llvmPackages.clang-tools
+              llvmPackages.lld
+              llvmPackages.lldb
+              gdb
+              pkg-config
+              gobject-introspection
+              cmake
+              meson
+              ninja
+              gnumake
+              python
+              pyright
+              ruff
+              nixd
+              nixfmt
+              shellcheck
+              actionlint
+              sccache
+              pipewire
+              wireplumber
+              pulseaudio
+              alsa-utils
+            ];
+            buildInputs = libraries;
+            OPENWAVE_DEV_SHELL = "1";
+            RUST_SRC_PATH = pkgs.rustPlatform.rustLibSrc;
+            LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+            RUST_BACKTRACE = "1";
+            shellHook = ''
+              export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath libraries}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+              export GI_TYPELIB_PATH="${pkgs.lib.makeSearchPath "lib/girepository-1.0" (map pkgs.lib.getLib typelibPackages)}''${GI_TYPELIB_PATH:+:$GI_TYPELIB_PATH}"
+              export XDG_DATA_DIRS="${pkgs.adwaita-icon-theme}/share''${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}"
+              export LADSPA_PATH="${pkgs.ladspaPlugins}/lib/ladspa''${LADSPA_PATH:+:$LADSPA_PATH}"
+            '';
+          };
+        }
+      );
+
+      formatter = forAllSystems (system: nixpkgs.legacyPackages.${system}.nixfmt);
     };
 }
