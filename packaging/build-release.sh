@@ -62,6 +62,11 @@ if [[ "$MODE" == tag ]]; then
 else
     V=$("$HELPER" version --file VERSION)
 fi
+NOTES="docs/releases/$V.md"
+if [[ "$MODE" == tag || -e "$NOTES" ]]; then
+    [[ -f "$NOTES" && ! -L "$NOTES" ]] || fail "missing approved release notes: $NOTES"
+    cp -- "$NOTES" "$OUT/release-notes.md"
+fi
 [[ ! -e vendor ]] || fail 'input already contains vendor; provide an unprepared source tree'
 # Cargo discovers the existing project configuration. Its emitted replacement
 # is semantically merged only in this staging tree, preserving target settings.
@@ -82,5 +87,10 @@ DIGEST=$(sha256sum "$OUT/$SOURCE"); DIGEST=${DIGEST%% *}
 "$HELPER" render-aur --version "$V" --sha256 "$DIGEST" --output "$OUT/PKGBUILD"
 printf '%s\n' "$V" > "$OUT/version.txt"
 printf 'mode=%s\ncommit=%s\ntag=%s\narchive=%s\nsha256=%s\n' "$MODE" "$COMMIT" "$TAG" "$SOURCE" "$DIGEST" > "$OUT/source-provenance.txt"
-(cd "$OUT" && sha256sum "$SOURCE" PKGBUILD version.txt source-provenance.txt > source.sha256)
+(
+    cd "$OUT"
+    objects=("$SOURCE" PKGBUILD version.txt source-provenance.txt)
+    [[ ! -f release-notes.md ]] || objects+=(release-notes.md)
+    sha256sum "${objects[@]}" > source.sha256
+)
 printf 'Prepared %s (%s); use build-native.sh then assemble-release.sh. No publication performed.\n' "$OUT/$SOURCE" "$MODE"

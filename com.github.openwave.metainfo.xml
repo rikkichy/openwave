@@ -35,4 +35,14 @@
     <modalias>usb:v0FD9p0070*</modalias>
   </supports>
   <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="1.1.0" date="2026-09-10">
+      <description>
+        <p>Breaking release: the Python implementation is replaced by native Rust
+        executables for x86-64 Linux. Update Python-based launch and service commands.</p>
+        <p>Expanded device support, dynamic mixes, scenes, capture processing,
+        safer ownership and shutdown, and confirmed installation removal.</p>
+      </description>
+    </release>
+  </releases>
 </component>

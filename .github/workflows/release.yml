@@ -144,7 +144,7 @@ jobs:
           done
           gh release create "$RELEASE_TAG" --verify-tag \
             --repo rikkichy/openwave --title "OpenWave ${RELEASE_TAG#v}" \
-            --generate-notes "${objects[@]}"
+            --notes-file release-notes.md "${objects[@]}"
 
   aur:
     needs: publish
