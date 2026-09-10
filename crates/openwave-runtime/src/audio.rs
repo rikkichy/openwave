@@ -322,7 +322,6 @@ fn drain_pin(
     let properties = serde_json::json!({"node.name":format!("openwave_keepalive_{name}"), "node.description":"OpenWave capture keepalive", "media.name":format!("OpenWave keepalive: {name}"), "application.name":"OpenWave", "node.dont-fallback":true, "node.dont-move":true, "node.dont-reconnect":true});
     let args = vec![
         "--record".into(),
-        "--raw".into(),
         "--target".into(),
         serial.into(),
         "--channels".into(),

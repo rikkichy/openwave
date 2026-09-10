@@ -266,25 +266,26 @@ fn record(source: &str, file: &str, expected: f64) -> Result {
     }
     // File is fresh, bounded by a ten-second timeout. Discard two seconds for
     // link establishment and old buffers, then require two seconds of samples.
-    if Path::new(file).exists() {
-        return Err("Refusing to overwrite PCM evidence".into());
-    }
+    let output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(file)?;
     let mut child = Command::new("timeout")
         .args([
             "--signal=INT",
             "--kill-after=2",
             "10",
             "pw-cat",
+            // Stdout is headerless PCM on PipeWire 1.0 as well as newer releases.
             "--record",
-            "--raw",
             "--format=f32",
             "--rate=48000",
             "--channels=2",
             "--target=0",
             "--properties={ node.name = smoke_recorder node.autoconnect = false }",
-            file,
+            "-",
         ])
-        .stdout(Stdio::null())
+        .stdout(Stdio::from(output))
         .spawn()?;
     let outcome = (|| -> Result {
         wait_for("measurement stereo links", || {
@@ -333,9 +334,9 @@ fn record(source: &str, file: &str, expected: f64) -> Result {
     // early is ambiguous: its intentional SIGINT shutdown also returns 1.
     // An early measurement failure cancels only the captured timeout child.
     if outcome.is_err() {
-        let _ = Command::new("kill")
-            .args(["-INT", &child.id().to_string()])
-            .status();
+        if let Some(pid) = rustix::process::Pid::from_raw(child.id() as i32) {
+            let _ = rustix::process::kill_process(pid, rustix::process::Signal::INT);
+        }
     }
     let status = child.wait()?;
     if outcome.is_ok() && status.code() != Some(124) {

@@ -82,14 +82,15 @@ if [[ ${1-} != --inside && ${1-} != --session ]]; then
         done
         printf '%s  %s\n' "$actual" "$(basename "$archive")" > "$output/evidence/source-archive.sha256"
     fi
-    # Resolve each required executable rather than exporting a host user PATH.
+    # Expose required executables, not their entire parent directories: doing
+    # the latter advertises host service-manager tools in a manager-free fixture.
     # Nix wrappers and their store dependencies are available read-only; neither
     # /run/current-system nor a home/profile directory is exposed to the sandbox.
-    tool_path=
-    for tool in bash dbus-run-session dbus-daemon dbus-uuidgen Xvfb xdotool import jq pipewire pipewire-pulse wireplumber pw-dump pw-cli pw-link pw-loopback pw-cat pw-top pactl pacat wpctl amixer aplay timeout sleep kill mkdir chmod cat cp cmp rm sha256sum date; do
-        executable=$(command -v "$tool") || { echo "Missing smoke capability: $tool" >&2; exit 1; }
+    mkdir -p "$output/bin"
+    for tool in bash env dbus-run-session dbus-daemon dbus-uuidgen Xvfb xdotool import jq pipewire pipewire-pulse wireplumber pw-dump pw-cli pw-link pw-loopback pw-cat pw-top pactl pacat wpctl amixer aplay timeout sleep mkdir chmod cat cp cmp rm sha256sum date tee; do
+        executable=$(type -P "$tool") || { echo "Missing smoke capability: $tool" >&2; exit 1; }
         executable=$(realpath "$executable")
-        tool_path="${tool_path:+$tool_path:}$(dirname "$executable")"
+        ln -s -- "$executable" "$output/bin/$tool"
     done
     command -v bwrap >/dev/null || { echo 'Missing bubblewrap; use a disposable namespace-capable VM/container.' >&2; exit 1; }
     dbus-uuidgen > "$output/machine-id"
@@ -107,7 +108,7 @@ if [[ ${1-} != --inside && ${1-} != --session ]]; then
     bwrap_args+=(--dev /dev --tmpfs /tmp --dir /run --dir /var --dir /var/tmp
         --bind "$output" /work --ro-bind "$prefix" /installed --ro-bind "$driver" /smoke-control
         --ro-bind "$source_root/packaging/smoke-install.sh" /smoke-install.sh
-        --setenv PATH "$tool_path" --setenv HOME /work/home
+        --setenv PATH /work/bin --setenv HOME /work/home
         --setenv XDG_CONFIG_HOME /work/config --setenv XDG_DATA_HOME /work/data
         --setenv XDG_STATE_HOME /work/state --setenv XDG_CACHE_HOME /work/cache
         --setenv XDG_RUNTIME_DIR /work/run --setenv OPENWAVE_SMOKE_SANDBOX 1
@@ -150,13 +151,26 @@ fi
 # The internal entry points are not a user-selectable host execution mode.
 [[ ${OPENWAVE_SMOKE_SANDBOX-} == 1 && $HOME == /work/home && $XDG_RUNTIME_DIR == /work/run && ! -e /dev/snd && ! -e /dev/bus/usb ]] || { echo 'Private sandbox guard failed.' >&2; exit 1; }
 if [[ $1 == --inside ]]; then
+    # Activate only the accessibility bus required by the GTK checks. Importing
+    # host service directories advertises unrelated services, including a
+    # systemd manager that deliberately does not exist in this private session.
+    mkdir -p /work/dbus-services
+    IFS=: read -ra service_data_dirs <<< "$XDG_DATA_DIRS"
+    for data_dir in "${service_data_dirs[@]}"; do
+        service="$data_dir/dbus-1/services/org.a11y.Bus.service"
+        if [[ -f $service ]]; then
+            cp -- "$service" /work/dbus-services/org.a11y.Bus.service
+            break
+        fi
+    done
+    [[ -f /work/dbus-services/org.a11y.Bus.service ]] || { echo 'Missing AT-SPI D-Bus activation service.' >&2; exit 1; }
     cat > /work/session.conf <<'DBUS'
 <!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN" "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
 <busconfig>
   <type>session</type>
   <listen>unix:tmpdir=/work/run</listen>
   <auth>EXTERNAL</auth>
-  <standard_session_servicedirs/>
+  <servicedir>/work/dbus-services</servicedir>
   <policy context="default">
     <allow send_destination="*" eavesdrop="true"/>
     <allow eavesdrop="true"/>
@@ -314,12 +328,18 @@ wireplumber.profiles = {
     }
 }
 POLICY
+# Ubuntu 24.04 ships WirePlumber 0.4, whose upstream policy-only configuration
+# is a separate file rather than the named profile introduced in 0.5.
+policy_args=(--profile=policy)
+if [[ $(wireplumber --version) == *"libwireplumber 0.4."* ]]; then
+    policy_args=(--config-file=policy.conf)
+fi
 server_ready() { [[ -S /work/run/pipewire-0 && -S /work/run/pulse/native ]] && timeout 3 pactl info > /work/evidence/pactl-info.txt && timeout 3 pw-dump > /work/evidence/ready-graph.json; }
 start_audio() {
     start pipewire_pid pipewire.log pipewire -c /work/private-pipewire.conf
     start pulse_pid pulse.log pipewire-pulse -c /work/private-pulse.conf
     wait_command server_ready
-    start policy_pid policy.log wireplumber --profile=policy
+    start policy_pid policy.log wireplumber "${policy_args[@]}"
     /smoke-control fixture-output > /work/evidence/fixture-output-module.txt
     pactl set-default-sink fixture_output
     for suffix in a b; do

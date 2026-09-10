@@ -28,7 +28,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential pkg-config libgtk-4-dev libadwaita-1-dev libusb-1.0-0-dev \
             adwaita-icon-theme pipewire pipewire-bin pipewire-pulse wireplumber alsa-utils pulseaudio-utils \
-            swh-plugins bubblewrap apparmor xvfb xauth dbus-x11 xdotool imagemagick jq rpm desktop-file-utils appstream
+            swh-plugins bubblewrap apparmor at-spi2-core xvfb xauth dbus-x11 xdotool imagemagick jq rpm desktop-file-utils appstream
       - name: Allow Bubblewrap to create the private test namespaces
         run: |
           # Ubuntu restricts unconfined user namespaces. Scope the exception to
@@ -75,5 +75,7 @@ jobs:
         if: always()
         with:
           name: smoke-${{ matrix.arch }}
-          path: ${{ runner.temp }}/smoke-evidence/
+          path: |
+            ${{ runner.temp }}/smoke-evidence/
+            !${{ runner.temp }}/smoke-evidence/bin/**
           if-no-files-found: warn
