@@ -36,6 +36,12 @@
   </supports>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.1.1" date="2026-09-10">
+      <description>
+        <p>Fix process-test isolation on CI runners and preserve package ownership
+        detection for missing files during interrupted removal and retry.</p>
+      </description>
+    </release>
     <release version="1.1.0" date="2026-09-10">
       <description>
         <p>Breaking release: the Python implementation is replaced by native Rust

@@ -775,6 +775,10 @@ pub(super) fn as_login_user(helper: &Path, snapshot: &InstallationSnapshot) -> R
 }
 
 #[cfg(test)]
+#[path = "../../tests/fixtures/private_proc.rs"]
+mod private_proc;
+
+#[cfg(test)]
 mod caller_tests {
     use super::*;
 
@@ -833,6 +837,26 @@ mod caller_tests {
 
     #[test]
     fn stale_start_identity_cannot_exempt_an_independent_owner() {
+        if std::env::var_os("OPENWAVE_CALLER_IDENTITY_FIXTURE").is_none() {
+            let temporary = tempfile::tempdir().unwrap();
+            let output = super::private_proc::fixture_command(temporary.path())
+                .args([
+                    "--exact",
+                    "uninstall::quiesce::caller_tests::stale_start_identity_cannot_exempt_an_independent_owner",
+                    "--nocapture",
+                ])
+                .env("OPENWAVE_CALLER_IDENTITY_FIXTURE", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "caller identity fixture: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        super::private_proc::require_private_proc();
         struct Owned(std::process::Child);
         impl Drop for Owned {
             fn drop(&mut self) {

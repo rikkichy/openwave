@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use std::{
     fs,
     os::unix::{
-        fs::{MetadataExt, PermissionsExt, symlink},
+        fs::{PermissionsExt, symlink},
         process::ExitStatusExt,
     },
     path::{Path, PathBuf},
@@ -18,66 +18,14 @@ use std::{
     time::Duration,
 };
 
+#[path = "fixtures/private_proc.rs"]
+mod private_proc;
+use private_proc::{fixture_command, require_private_proc};
+
 fn put(path: &Path, bytes: &[u8], mode: u32) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, bytes).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
-}
-// A nested proc mount may not expose kernel-global entries masked by the
-// outer sandbox. Reuse that mount only after proving its PID/user ownership;
-// the opt-in is not itself evidence and never grants a host fallback.
-fn require_private_proc() {
-    let uid = rustix::process::geteuid().as_raw();
-    assert_ne!(uid, 0);
-    let mapping = fs::read_to_string("/proc/self/uid_map").unwrap();
-    let maps: Vec<_> = mapping.split_whitespace().collect();
-    assert_eq!(maps.len(), 3);
-    assert_eq!(maps[0].parse::<u32>().unwrap(), uid);
-    assert_eq!(
-        maps[2], "1",
-        "Initial or broad user namespace is not a fixture"
-    );
-    for namespace in ["pid", "user"] {
-        assert_eq!(
-            fs::read_link(format!("/proc/self/ns/{namespace}")).unwrap(),
-            fs::read_link(format!("/proc/1/ns/{namespace}")).unwrap(),
-            "procfs must belong to the current private PID/user namespace"
-        );
-    }
-    assert_eq!(fs::metadata("/proc/1").unwrap().uid(), uid);
-    assert_eq!(
-        fs::read_link("/proc/self").unwrap(),
-        PathBuf::from(std::process::id().to_string())
-    );
-    for path in ["/sys", "/dev/snd", "/dev/bus/usb", "/run/user"] {
-        assert!(!Path::new(path).exists(), "Host resource exposed: {path}");
-    }
-    if Path::new("/proc/asound").exists() {
-        assert!(fs::read_dir("/proc/asound").unwrap().next().is_none());
-        let mounts = fs::read_to_string("/proc/self/mountinfo").unwrap();
-        assert!(
-            mounts.lines().any(|line| {
-                line.split_whitespace().nth(4) == Some("/proc/asound")
-                    && line
-                        .split_once(" - ")
-                        .is_some_and(|(_, tail)| tail.starts_with("tmpfs "))
-            }),
-            "ALSA proc data must remain masked by a private tmpfs"
-        );
-    }
-    for name in [
-        "DBUS_SESSION_BUS_ADDRESS",
-        "DBUS_SYSTEM_BUS_ADDRESS",
-        "DISPLAY",
-        "WAYLAND_DISPLAY",
-        "PULSE_SERVER",
-        "PIPEWIRE_REMOTE",
-    ] {
-        assert!(
-            std::env::var_os(name).is_none(),
-            "Unexpected session resource: {name}"
-        );
-    }
 }
 
 fn child(mode: &str) {
@@ -87,49 +35,7 @@ fn child(mode: &str) {
         fs::create_dir(root.join(name)).unwrap();
         fs::set_permissions(root.join(name), fs::Permissions::from_mode(0o700)).unwrap();
     }
-    let executable = std::env::current_exe().unwrap();
-    let binaries = executable.parent().unwrap().parent().unwrap();
-    let reuse = std::env::var_os("OPENWAVE_TEST_PRIVATE_PROC").is_some();
-    let mut namespace = if reuse {
-        require_private_proc();
-        Command::new(&executable)
-    } else {
-        let bwrap = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-            .map(|directory| directory.join("bwrap"))
-            .find(|path| path.is_file())
-            .expect("uninstall process-ownership fixtures require bubblewrap from nix develop");
-        Command::new(bwrap)
-    };
-    if !reuse {
-        namespace.args([
-            "--unshare-all",
-            "--as-pid-1",
-            "--die-with-parent",
-            "--new-session",
-            "--ro-bind",
-            "/",
-            "/",
-            "--proc",
-            "/proc",
-            "--dev",
-            "/dev",
-            "--tmpfs",
-            "/tmp",
-        ]);
-        if Path::new("/proc/asound").exists() {
-            namespace.args(["--tmpfs", "/proc/asound"]);
-        }
-        namespace
-            .arg("--ro-bind")
-            .arg(binaries)
-            .arg(binaries)
-            .arg("--bind")
-            .arg(root)
-            .arg(root)
-            .args(["--chdir", "/"]);
-        namespace.arg(&executable);
-    }
-    let result = namespace
+    let result = fixture_command(root)
         .args(["--exact", "removal_environment_fixture", "--nocapture"])
         .env("OPENWAVE_REMOVAL_FIXTURE", mode)
         .env("OPENWAVE_FIXTURE_ROOT", root)
@@ -139,8 +45,6 @@ fn child(mode: &str) {
         .env("XDG_STATE_HOME", root.join("state"))
         .env("XDG_RUNTIME_DIR", root.join("runtime"))
         .env("PATH", root.join("empty-bin"))
-        .env_remove("DBUS_SESSION_BUS_ADDRESS")
-        .env_remove("FLATPAK_ID")
         .output()
         .unwrap();
     assert!(
@@ -297,9 +201,7 @@ fn removal_environment_fixture() {
         !rustix::process::geteuid().is_root(),
         "User removal fixtures must run as an unprivileged user, never host root"
     );
-    if std::env::var_os("OPENWAVE_TEST_PRIVATE_PROC").is_some() {
-        require_private_proc();
-    }
+    require_private_proc();
     let root = PathBuf::from(std::env::var_os("OPENWAVE_FIXTURE_ROOT").unwrap());
     let mut fixture = Fixture::new(root.clone());
     match mode.as_str() {

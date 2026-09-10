@@ -28,11 +28,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential pkg-config libgtk-4-dev libadwaita-1-dev libusb-1.0-0-dev \
             adwaita-icon-theme pipewire pipewire-bin pipewire-pulse wireplumber alsa-utils pulseaudio-utils \
-            swh-plugins bubblewrap xvfb xauth dbus-x11 xdotool imagemagick jq desktop-file-utils appstream
+            swh-plugins bubblewrap xvfb xauth dbus-x11 xdotool imagemagick jq rpm desktop-file-utils appstream
       - name: Install exact official toolchain
         run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy
       - name: Exercise native behavior
         run: cargo test --locked --workspace
+      - name: Verify missing-file RPM ownership against a private database
+        run: cargo test --locked -p openwave-runtime --lib installation::package_query_tests::real_rpm_database_preserves_missing_file_ownership -- --ignored --exact
       - name: Build actual installed application and smoke drivers
         run: |
           cargo build --release --locked --workspace --bins
