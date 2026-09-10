@@ -28,7 +28,26 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential pkg-config libgtk-4-dev libadwaita-1-dev libusb-1.0-0-dev \
             adwaita-icon-theme pipewire pipewire-bin pipewire-pulse wireplumber alsa-utils pulseaudio-utils \
-            swh-plugins bubblewrap xvfb xauth dbus-x11 xdotool imagemagick jq rpm desktop-file-utils appstream
+            swh-plugins bubblewrap apparmor xvfb xauth dbus-x11 xdotool imagemagick jq rpm desktop-file-utils appstream
+      - name: Allow Bubblewrap to create the private test namespaces
+        run: |
+          # Ubuntu restricts unconfined user namespaces. Scope the exception to
+          # the sandbox executable, not a global kernel security switch.
+          if [[ -r /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]] &&
+             [[ $(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns) == 1 ]]; then
+            sudo tee /etc/apparmor.d/bwrap >/dev/null <<'PROFILE'
+          abi <abi/4.0>,
+          include <tunables/global>
+          profile bwrap /usr/bin/bwrap flags=(unconfined) {
+            userns,
+          }
+          PROFILE
+            sudo apparmor_parser -r /etc/apparmor.d/bwrap
+          fi
+          bwrap --version
+          bwrap --unshare-all --die-with-parent --cap-drop ALL \
+            --ro-bind /usr /usr --ro-bind /lib /lib --ro-bind /lib64 /lib64 \
+            --proc /proc --dev /dev /usr/bin/true
       - name: Install exact official toolchain
         run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy
       - name: Exercise native behavior
