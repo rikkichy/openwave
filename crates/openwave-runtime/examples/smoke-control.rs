@@ -114,7 +114,34 @@ fn command(program: &str, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8(out.stdout)?)
 }
 fn graph() -> Result<Vec<Value>> {
-    Ok(serde_json::from_str(&command("pw-dump", &[])?)?)
+    parse_graph(&command("pw-dump", &[])?)
+}
+fn parse_graph(text: &str) -> Result<Vec<Value>> {
+    // Even a one-shot pw-dump can emit removals before or after its snapshot.
+    // Apply batches in order so an old removal cannot erase a reused identity.
+    let mut objects = HashMap::new();
+    let mut observed = false;
+    for batch in serde_json::Deserializer::from_str(text).into_iter::<Vec<Value>>() {
+        observed = true;
+        for object in batch? {
+            let id = object["id"].as_u64().ok_or("PipeWire object lacks an ID")?;
+            if object["type"].is_string() {
+                objects.insert(id, object);
+            } else if object.as_object().is_some_and(|fields| {
+                fields.iter().all(|(key, value)| {
+                    key == "id" || (matches!(key.as_str(), "info" | "props") && value.is_null())
+                })
+            }) {
+                objects.remove(&id);
+            } else {
+                return Err("Invalid PipeWire removal record".into());
+            }
+        }
+    }
+    if !observed {
+        return Err("Empty PipeWire graph output".into());
+    }
+    Ok(objects.into_values().collect())
 }
 fn node<'a>(graph: &'a [Value], name: &str) -> Result<&'a Value> {
     let nodes: Vec<_> = graph
@@ -935,5 +962,34 @@ fn main() {
     if let Err(error) = run() {
         eprintln!("smoke-control: {error}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn graph_removals_preserve_reused_identities_and_remove_retired_nodes() {
+        let objects = parse_graph(
+            r#"[{"id":7,"info":null}]
+            [{"id":0,"type":"PipeWire:Interface:Core","info":{"cookie":41}},
+             {"id":7,"type":"PipeWire:Interface:Node","info":{"props":{"node.name":"fixture_reused","object.serial":700}}},
+             {"id":8,"type":"PipeWire:Interface:Node","info":{"props":{"node.name":"fixture_retired","object.serial":800}}}]
+            [{"id":8,"info":null}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            identity(&objects, "fixture_reused").unwrap(),
+            json!({"cookie":41,"serial":700})
+        );
+        assert!(node(&objects, "fixture_retired").is_err());
+    }
+
+    #[test]
+    fn malformed_trailing_graph_data_never_returns_a_partial_snapshot() {
+        assert!(
+            parse_graph(r#"[{"id":7,"type":"PipeWire:Interface:Node"}] [{"id":7,"info":"#).is_err()
+        );
     }
 }

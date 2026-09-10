@@ -6,6 +6,10 @@ rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 
+[[example]]
+name = "smoke-control"
+test = true
+
 [dependencies]
 openwave-core.workspace = true
 serde.workspace = true
