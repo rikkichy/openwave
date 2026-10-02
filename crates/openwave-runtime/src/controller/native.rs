@@ -104,6 +104,7 @@ impl HostWorker {
                                             &paths, &host,
                                         )),
                                         setup_required: false,
+                                        usb_update: false,
                                     });
                                     Ok(outcome)
                                 })
@@ -339,17 +340,17 @@ impl NativeBackend {
     pub(super) fn new(paths: RuntimePaths, allowed_bus_owner: Option<String>) -> Result<Self> {
         let installation_lease = Lease::installation_shared(&paths.identity)?;
         let mut queued = VecDeque::new();
-        let required = if setup::is_sandboxed() {
-            false
+        let (required, usb_update) = if setup::is_sandboxed() {
+            (false, false)
         } else {
             match setup::inspect(&paths) {
-                Ok(state) => state.required,
+                Ok(state) => (state.required, state.usb_update),
                 Err(error) => {
                     queued.push_back(BackendEvent::Error(OperationIssue {
                         target: "setup inspection".into(),
                         message: error.to_string(),
                     }));
-                    true
+                    (true, false)
                 }
             }
         };
@@ -361,6 +362,7 @@ impl NativeBackend {
         queued.push_back(BackendEvent::Status {
             service: service_status,
             setup_required: required,
+            usb_update,
         });
         let host = HostWorker::start(paths.clone())?;
         let mut backend = Self {
@@ -727,6 +729,7 @@ mod tests {
                     BackendEvent::Status {
                         service,
                         setup_required,
+                        ..
                     } => {
                         assert!(!setup_required);
                         displayed_warning = service;
@@ -791,6 +794,7 @@ mod tests {
                 send.send(BackendEvent::Status {
                     service: "drained".into(),
                     setup_required: false,
+                    usb_update: false,
                 })
                 .unwrap();
             });

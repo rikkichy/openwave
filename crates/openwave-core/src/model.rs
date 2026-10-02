@@ -752,6 +752,8 @@ pub enum SetupPhase {
     #[default]
     Checking,
     Required,
+    /// Only an OpenWave-owned USB rule predating newly supported devices needs refreshing.
+    UsbUpdate,
     Running,
     Replug(String),
     Failed(String),

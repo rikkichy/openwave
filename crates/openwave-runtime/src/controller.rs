@@ -396,6 +396,7 @@ pub enum BackendEvent {
     Status {
         service: String,
         setup_required: bool,
+        usb_update: bool,
     },
     Error(OperationIssue),
 }

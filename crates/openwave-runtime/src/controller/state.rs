@@ -1060,11 +1060,14 @@ impl Controller {
             BackendEvent::Status {
                 service,
                 setup_required,
+                usb_update,
             } => {
                 self.view.service_status = service;
                 self.view.setup_required = setup_required;
                 if self.view.setup_phase == SetupPhase::Checking {
-                    self.view.setup_phase = if setup_required {
+                    self.view.setup_phase = if setup_required && usb_update {
+                        SetupPhase::UsbUpdate
+                    } else if setup_required {
                         SetupPhase::Required
                     } else {
                         SetupPhase::Ready

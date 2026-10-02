@@ -167,6 +167,7 @@ impl Rig {
             .send(BackendEvent::Status {
                 service: label.into(),
                 setup_required: false,
+                usb_update: false,
             })
             .unwrap();
         self.wait(|s| s.service_status == label);
@@ -978,6 +979,22 @@ fn capture_removal_does_not_publish_topology_when_preferences_are_corrupt() {
 }
 
 #[test]
+fn outdated_usb_rule_asks_for_a_usb_update_through_the_same_setup() {
+    let f = Rig::controlled(json!({}), json!({}), None, None, None);
+    f.incoming
+        .send(BackendEvent::Status {
+            service: String::new(),
+            setup_required: true,
+            usb_update: true,
+        })
+        .unwrap();
+    f.wait(|snapshot| snapshot.setup_phase == SetupPhase::UsbUpdate);
+    assert!(f.handle.snapshot().setup_required);
+    f.submit(AppCommand::RunSetup);
+    f.wait(|snapshot| snapshot.setup_phase == SetupPhase::Running);
+}
+
+#[test]
 fn repeated_activation_failures_remain_retryable_without_running_host_setup() {
     let (release, activation) = mpsc::channel();
     let mut f = Rig::controlled(json!({}), json!({}), None, Some(activation), None);
@@ -985,6 +1002,7 @@ fn repeated_activation_failures_remain_retryable_without_running_host_setup() {
         .send(BackendEvent::Status {
             service: "setup-required".into(),
             setup_required: true,
+            usb_update: false,
         })
         .unwrap();
     f.wait(|snapshot| snapshot.setup_phase == SetupPhase::Required);

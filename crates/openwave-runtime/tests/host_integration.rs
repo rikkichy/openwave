@@ -844,6 +844,47 @@ fn udev_admission_requires_meaning_not_pid_substrings() {
     assert!(setup::udev_contents_cover(reordered));
 }
 #[test]
+fn outdated_owned_usb_rule_alone_asks_only_for_a_usb_update() {
+    let f = Fixture::new("systemctl");
+    let rule = f.host.udev_directory.join("99-openwave.rules");
+    fs::write(&rule, setup::udev_rules()).unwrap();
+    setup::run_with(&f.paths, &default_mixes(), &f.host).unwrap();
+    let state = setup::inspect_with(&f.paths, &f.host).unwrap();
+    assert!(!state.required && !state.usb_update, "{}", state.message);
+    // A rule written by an older OpenWave that predates a newly supported device.
+    let older: String = setup::udev_rules()
+        .lines()
+        .filter(|line| !line.contains("\"00c7\""))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    assert_ne!(older, setup::udev_rules());
+    fs::write(&rule, &older).unwrap();
+    let state = setup::inspect_with(&f.paths, &f.host).unwrap();
+    assert!(state.required && state.usb_update, "{}", state.message);
+    // Foreign content is not ours to refresh: that stays first-run setup.
+    fs::write(&rule, format!("{older}SUBSYSTEM==\"usb\", MODE=\"0600\"\n")).unwrap();
+    let state = setup::inspect_with(&f.paths, &f.host).unwrap();
+    assert!(state.required && !state.usb_update);
+    // No rule at all is first-run setup.
+    fs::remove_file(&rule).unwrap();
+    let state = setup::inspect_with(&f.paths, &f.host).unwrap();
+    assert!(state.required && !state.usb_update);
+    // Any other drift alongside the outdated rule is first-run setup too.
+    fs::write(&rule, &older).unwrap();
+    let wp = f
+        .host
+        .config_home
+        .join("wireplumber/wireplumber.conf.d")
+        .join(setup::WIREPLUMBER_NAME);
+    fs::write(&wp, "stale\n").unwrap();
+    let state = setup::inspect_with(&f.paths, &f.host).unwrap();
+    assert!(state.required && !state.usb_update);
+    // A current rule with other drift is first-run setup.
+    fs::write(&rule, setup::udev_rules()).unwrap();
+    let state = setup::inspect_with(&f.paths, &f.host).unwrap();
+    assert!(state.required && !state.usb_update);
+}
+#[test]
 fn sandbox_and_unsupported_setup_do_not_mutate_native_integration() {
     let mut f = Fixture::new("none");
     f.host.sandboxed = true;

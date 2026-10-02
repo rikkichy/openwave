@@ -300,6 +300,7 @@ impl Rig {
             .send(BackendEvent::Status {
                 service: label.into(),
                 setup_required: false,
+                usb_update: false,
             })
             .unwrap();
         self.wait(|snapshot| snapshot.service_status == label);

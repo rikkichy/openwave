@@ -25,6 +25,9 @@ const RULE_DIRECTORY: &str = "/etc/udev/rules.d";
 #[derive(Debug, Clone)]
 pub struct SetupState {
     pub required: bool,
+    /// Required only because an OpenWave-owned USB rule predates newly
+    /// supported devices; everything else is already configured.
+    pub usb_update: bool,
     pub message: String,
 }
 #[derive(Debug, Clone)]
@@ -176,20 +179,29 @@ pub fn inspect_with(paths: &RuntimePaths, host: &HostContext) -> Result<SetupSta
     if host.sandboxed {
         return Ok(SetupState {
             required: false,
+            usb_update: false,
             message: SANDBOX_GUIDANCE.into(),
         });
     }
     let source = fs::read_to_string(paths.data_file(&format!("wireplumber/{WIREPLUMBER_NAME}"))?)?;
     let service = service::status_with(paths, host)?;
-    let needed = !udev_installed(host)?
-        || service::read_optional(&wireplumber_path(host))?.as_deref() != Some(&source)
+    let usb = udev_installed(host)?;
+    let rest = service::read_optional(&wireplumber_path(host))?.as_deref() != Some(&source)
         || service::read_optional(&mixes_path(host))?.as_deref()
             != Some(&render_mixes_conf(&mixes)?)
         || !service.running
         || service.failed
         || service.message.contains("needs refresh");
+    let needed = !usb || rest;
+    // An upgrade that adds devices leaves the rule an older OpenWave wrote
+    // behind; refreshing it is not first-run setup.
+    let usb_update = !usb
+        && !rest
+        && service::read_optional(&host.udev_directory.join(RULE_NAME))?
+            .is_some_and(|text| owned_rule_file(&text));
     Ok(SetupState {
         required: needed,
+        usb_update,
         message: if needed {
             format!("Setup required. {}", service.message)
         } else {

@@ -926,15 +926,8 @@ impl AppUi {
             }
             return;
         }
-        let (heading, body) = match phase {
-            SetupPhase::Checking => ("Checking OpenWave setup", "Inspecting USB permissions, audio configuration and the capture service. No device controls are opened during setup inspection.".to_string()),
-            SetupPhase::Required => ("First-Time Setup", "OpenWave needs to configure USB permissions and install the audio service.\n\nYou may be prompted for your password.".to_string()),
-            SetupPhase::Running => ("Setting Up OpenWave", "Configuring USB permissions, user audio rules, mixes and the capture service. This window remains responsive.".to_string()),
-            SetupPhase::Replug(message) => ("Setup Complete", format!("{message}\n\nPlease replug your Elgato Wave device, then click Continue.")),
-            SetupPhase::Failed(message) => ("Setup Failed", message.clone()),
-            SetupPhase::Starting => ("Starting OpenWave", "Opening the device and audio workers. No host setup changes are made.".to_string()),
-            SetupPhase::ActivationFailed(message) => ("OpenWave could not start", format!("{message}\n\nResolve the problem, then retry starting OpenWave.")),
-            SetupPhase::Ready => return,
+        let Some((heading, body)) = setup_text(phase) else {
+            return;
         };
         let dialog = adw::AlertDialog::builder()
             .heading(heading)
@@ -956,13 +949,13 @@ impl AppUi {
             dialog.add_response("uninstall", "Uninstall OpenWave…");
         }
         match phase {
-            SetupPhase::Required | SetupPhase::Failed(_) => {
+            SetupPhase::Required | SetupPhase::UsbUpdate | SetupPhase::Failed(_) => {
                 dialog.add_response(
                     "setup",
-                    if phase == &SetupPhase::Required {
-                        "Set Up"
-                    } else {
-                        "Retry Setup"
+                    match phase {
+                        SetupPhase::Required => "Set Up",
+                        SetupPhase::UsbUpdate => "Update",
+                        _ => "Retry Setup",
                     },
                 );
                 dialog.set_response_appearance("setup", adw::ResponseAppearance::Suggested);
@@ -1106,6 +1099,21 @@ fn application_menu() -> gio::Menu {
     menu
 }
 
+/// Setup dialog heading and body; `None` once OpenWave is ready.
+fn setup_text(phase: &SetupPhase) -> Option<(&'static str, String)> {
+    Some(match phase {
+        SetupPhase::Checking => ("Checking OpenWave setup", "Inspecting USB permissions, audio configuration and the capture service. No device controls are opened during setup inspection.".to_string()),
+        SetupPhase::Required => ("First-Time Setup", "OpenWave needs to configure USB permissions and install the audio service.\n\nYou may be prompted for your password.".to_string()),
+        SetupPhase::UsbUpdate => ("Update USB Permissions", "This version of OpenWave supports more devices, so the USB permission rule installed by an earlier version needs to be refreshed. Your existing setup is kept.\n\nYou will be prompted for your password once.".to_string()),
+        SetupPhase::Running => ("Setting Up OpenWave", "Configuring USB permissions, user audio rules, mixes and the capture service. This window remains responsive.".to_string()),
+        SetupPhase::Replug(message) => ("Setup Complete", format!("{message}\n\nPlease replug your Elgato Wave device, then click Continue.")),
+        SetupPhase::Failed(message) => ("Setup Failed", message.clone()),
+        SetupPhase::Starting => ("Starting OpenWave", "Opening the device and audio workers. No host setup changes are made.".to_string()),
+        SetupPhase::ActivationFailed(message) => ("OpenWave could not start", format!("{message}\n\nResolve the problem, then retry starting OpenWave.")),
+        SetupPhase::Ready => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1158,6 +1166,18 @@ mod tests {
             actions,
             ["win.settings", "win.reload-interface", "app.uninstall"]
         );
+    }
+
+    #[test]
+    fn outdated_usb_rule_is_not_presented_as_first_time_setup() {
+        let (heading, body) = setup_text(&SetupPhase::UsbUpdate).unwrap();
+        assert_eq!(heading, "Update USB Permissions");
+        assert!(body.contains("supports more devices"));
+        assert_eq!(
+            setup_text(&SetupPhase::Required).unwrap().0,
+            "First-Time Setup"
+        );
+        assert!(setup_text(&SetupPhase::Ready).is_none());
     }
 
     #[test]

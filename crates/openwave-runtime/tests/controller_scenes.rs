@@ -193,6 +193,7 @@ impl Fixture {
             .send(BackendEvent::Status {
                 service: "connected".into(),
                 setup_required: false,
+                usb_update: false,
             })
             .unwrap();
         self.wait_snapshot(|snapshot| {
@@ -361,6 +362,7 @@ fn scene_waits_for_every_unit_and_reports_eventual_failure_without_early_mute_ba
         .send(BackendEvent::Status {
             service: "one-result".into(),
             setup_required: false,
+            usb_update: false,
         })
         .unwrap();
     f.wait_snapshot(|s| s.service_status == "one-result");
