@@ -60,6 +60,7 @@ struct World {
     inputs: HashMap<u32, Value>,
     links: HashSet<(u32, u32)>,
     levels: HashMap<u32, (f64, bool)>,
+    level_writes: HashMap<u32, usize>,
     modules: HashMap<u32, u32>,
     children: HashMap<u32, Vec<u32>>,
     definitions: Mixes,
@@ -353,6 +354,7 @@ impl GraphBackend for FakeBackend {
             return Err(failed());
         }
         w.levels.insert(node, (level, muted));
+        *w.level_writes.entry(node).or_default() += 1;
         for sink in w.sinks.values_mut() {
             if sink["index"] == node {
                 sink["mute"] = json!(muted);
@@ -1816,6 +1818,29 @@ fn foreign_route_node_never_receives_level_or_links() {
         o.revision == f.revision && o.errors.iter().any(|e| e.target == "cell:mic.chat")
     });
     assert!(!blocked.silent_sources.contains_key(&sid("mic")));
+}
+
+#[test]
+fn muted_source_cell_is_silenced_once_not_on_every_reconcile() {
+    let mut f = Fixture::new();
+    f.world.lock().unwrap().capture("microphone", 1);
+    f.device("mic", "microphone", 1);
+    f.desired.sources.get_mut(&sid("mic")).unwrap().muted = true;
+    f.cell("mic", "chat", 0.8);
+    let name = routing::cell_route_name(&sid("mic"), &mid("chat"));
+    f.apply();
+    f.until(|w| w.route("microphone", "openwave_chat_mix", Some((0.8, true))));
+    let writes = |f: &Fixture| {
+        let w = f.world.lock().unwrap();
+        w.level_writes[&w.node_id(&name).unwrap()]
+    };
+    f.cycles(5);
+    assert_eq!(writes(&f), 1, "steady muted cell must not be rewritten");
+    f.desired.sources.get_mut(&sid("mic")).unwrap().level = 0.5;
+    f.apply();
+    f.until(|w| w.route("microphone", "openwave_chat_mix", Some((0.4, true))));
+    f.cycles(5);
+    assert_eq!(writes(&f), 2, "a changed level is applied exactly once");
 }
 
 #[test]

@@ -1912,14 +1912,18 @@ impl Reconciler {
                 }
                 match graph.owned(&route.name, &route.owner) {
                     Some(node) => {
-                        self.backend
-                            .set_level(node.id, volume * source.level, true)
-                            .map_err(|error| {
-                                unavailable(format!(
-                                    "Cannot silence {sid}; group handover deferred: {error}"
-                                ))
-                            })?;
-                        route.applied = Some((node.identity.clone(), volume * source.level, true));
+                        let level = volume * source.level;
+                        let applied = (node.identity.clone(), level, true);
+                        if route.applied.as_ref() != Some(&applied) {
+                            self.backend
+                                .set_level(node.id, level, true)
+                                .map_err(|error| {
+                                    unavailable(format!(
+                                        "Cannot silence {sid}; group handover deferred: {error}"
+                                    ))
+                                })?;
+                            route.applied = Some(applied);
+                        }
                     }
                     None => {
                         self.drop_route(&key)?;
