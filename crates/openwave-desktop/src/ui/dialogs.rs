@@ -480,6 +480,14 @@ fn source_picker(
     nav.push(&page);
 }
 
+/// Typed text may name several applications at once, separated by commas.
+fn typed_names(text: &str) -> Vec<&str> {
+    text.split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+
 struct Bindings {
     list: gtk::ListBox,
     names: RefCell<Vec<String>>,
@@ -490,7 +498,7 @@ impl Bindings {
     fn valid(&self) {
         if let Some(confirm) = self.confirm.upgrade() {
             confirm.set_sensitive(
-                !self.names.borrow().is_empty() || !self.pending.text().trim().is_empty(),
+                !self.names.borrow().is_empty() || !typed_names(&self.pending.text()).is_empty(),
             );
         }
     }
@@ -508,6 +516,11 @@ impl Bindings {
             self.names.borrow_mut().push(text.into());
         }
         self.rebuild();
+    }
+    fn add_typed(self: &Rc<Self>, text: &str) {
+        for name in typed_names(text) {
+            self.add(name);
+        }
     }
     fn rebuild(self: &Rc<Self>) {
         while let Some(child) = self.list.first_child() {
@@ -570,7 +583,7 @@ fn source_config(
         let add = gtk::Button::builder()
             .icon_name("list-add-symbolic")
             .valign(gtk::Align::Center)
-            .tooltip_text("Add this name")
+            .tooltip_text("Add this name; separate several with commas")
             .build();
         add.add_css_class("flat");
         pending.add_suffix(&add);
@@ -584,7 +597,7 @@ fn source_config(
         add.connect_clicked(move |_| {
             if let Some(b) = weak.upgrade() {
                 let text = b.pending.text();
-                b.add(&text);
+                b.add_typed(&text);
                 b.pending.set_text("");
             }
         });
@@ -592,7 +605,7 @@ fn source_config(
         pending.connect_entry_activated(move |_| {
             if let Some(b) = weak.upgrade() {
                 let text = b.pending.text();
-                b.add(&text);
+                b.add_typed(&text);
                 b.pending.set_text("");
             }
         });
@@ -660,7 +673,7 @@ fn source_config(
     save.connect_clicked(move |_| {
         let names = bindings.as_ref().map(|b| {
             let text = b.pending.text();
-            b.add(&text);
+            b.add_typed(&text);
             b.names.borrow().clone()
         });
         if names.as_ref().is_some_and(Vec::is_empty) {
@@ -711,6 +724,14 @@ fn source_config(
 mod tests {
     use super::*;
     use crate::ui::test_support::{Rig, descendants, icons};
+
+    #[test]
+    fn typed_names_split_on_commas() {
+        assert_eq!(typed_names("Player, player-bin"), ["Player", "player-bin"]);
+        assert_eq!(typed_names("  Player  "), ["Player"]);
+        assert_eq!(typed_names(" , a,,b , "), ["a", "b"]);
+        assert!(typed_names(" , ").is_empty());
+    }
 
     #[test]
     #[ignore = "requires the isolated installed GTK test runner"]
