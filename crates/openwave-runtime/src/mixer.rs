@@ -27,6 +27,9 @@ const POLL_INTERVAL: Duration = Duration::from_secs(1);
 const FX_RETRY: Duration = Duration::from_secs(5);
 const CLEANUP_ATTEMPTS: usize = 3;
 const CLEANUP_SETTLE: Duration = Duration::from_millis(100);
+// A full pass costs two pw-dumps and five pactl calls (~190 ms live), so a held
+// dial retunes routes in place and the verifying pass waits for it to settle.
+const RETUNE_SETTLE: Duration = Duration::from_millis(250);
 fn unavailable(message: impl Into<String>) -> OperationError {
     OperationError::new(ErrorCode::Unavailable, message)
 }
@@ -504,6 +507,8 @@ pub trait GraphBackend: Send {
     fn move_stream(&mut self, stream: &StreamSnapshot, sink: &str) -> Result<()>;
     fn link(&mut self, source: u32, target: u32) -> Result<()>;
     fn set_level(&mut self, node: u32, level: f64, muted: bool) -> Result<()>;
+    /// Volume alone, for a node whose mute already matches the request.
+    fn set_volume(&mut self, node: u32, level: f64) -> Result<()>;
     fn set_capture_mute(&mut self, node: &CaptureSnapshot, muted: bool) -> Result<()>;
     fn spawn_loopback(
         &mut self,
@@ -643,6 +648,12 @@ impl GraphBackend for SubprocessPipeWire {
             self.command("wpctl", &["set-mute".into(), node.to_string(), "0".into()])?;
         }
         Ok(())
+    }
+    fn set_volume(&mut self, node: u32, level: f64) -> Result<()> {
+        self.command(
+            "wpctl",
+            &["set-volume".into(), node.to_string(), level.to_string()],
+        )
     }
     fn set_capture_mute(&mut self, node: &CaptureSnapshot, muted: bool) -> Result<()> {
         self.command(
@@ -932,6 +943,9 @@ struct Route {
     name: String,
     owner: String,
     applied: Option<(NodeIdentity, f64, bool)>,
+    // Global id of the playback node in the last snapshot that saw it. Valid only
+    // while the child runs: retune trusts it without a snapshot of its own.
+    node: Option<u32>,
     missing: u8,
 }
 #[derive(Clone, Debug, PartialEq)]
@@ -1013,8 +1027,11 @@ impl Reconciler {
         }
     }
     fn run(&mut self, interval: Duration) -> Result<()> {
+        // A full pass owed after in-place retunes: (first retune, quiet deadline).
+        // Capped at one interval so a dial held forever still gets verified.
+        let mut owed: Option<(Instant, Instant)> = None;
         loop {
-            let update = {
+            let (woken, captures_pending, update) = {
                 let mut control = self
                     .shared
                     .control
@@ -1023,15 +1040,34 @@ impl Reconciler {
                 if control.stopped {
                     break;
                 }
-                control.wake = false;
-                control
+                let woken = std::mem::take(&mut control.wake);
+                let pending = control
+                    .capture_requests
+                    .values()
+                    .any(|request| request.written.is_none());
+                let update = control
                     .desired
                     .as_ref()
-                    .map(|desired| (control.revision, desired.clone()))
+                    .map(|desired| (control.revision, desired.clone()));
+                (woken, pending, update)
             };
+            let now = Instant::now();
             if let Some((revision, desired)) = update {
+                let first = owed.map_or(now, |(first, _)| first);
+                // A capture mute rides only on the full pass; never defer it.
+                let retuned = woken
+                    && !captures_pending
+                    && now.duration_since(first) < interval
+                    && self.retune(&desired);
                 self.update(revision, desired);
-                self.cycle();
+                if retuned {
+                    owed = Some((first, now + RETUNE_SETTLE.min(interval)));
+                } else if woken
+                    || owed.is_none_or(|(first, quiet)| now >= quiet.min(first + interval))
+                {
+                    self.cycle();
+                    owed = None;
+                }
             }
             let control = self
                 .shared
@@ -1042,14 +1078,118 @@ impl Reconciler {
                 break;
             }
             if !control.wake {
+                let timeout = owed.map_or(interval, |(first, quiet)| {
+                    quiet
+                        .min(first + interval)
+                        .saturating_duration_since(Instant::now())
+                });
                 let _guard = self
                     .shared
                     .wake
-                    .wait_timeout(control, interval)
+                    .wait_timeout(control, timeout)
                     .map_err(|_| unavailable("Mixer control lock poisoned"))?;
             }
         }
         self.teardown()
+    }
+    /// Apply an edit that only moves levels straight to the routes it touches,
+    /// one volume write each, skipping the snapshot. Anything else — a mute, a
+    /// level crossing zero (which opens or silences a route), a route not yet
+    /// applied or not running — returns false and takes the full pass.
+    fn retune(&mut self, desired: &DesiredState) -> bool {
+        let old = &self.desired;
+        if old.mixes != desired.mixes
+            || old.scenes != desired.scenes
+            || old.matrix.outputs != desired.matrix.outputs
+            || old.matrix.volumes != desired.matrix.volumes
+            || old.matrix.extra != desired.matrix.extra
+            || !old.sources.keys().eq(desired.sources.keys())
+            || !old.matrix.cells.keys().eq(desired.matrix.cells.keys())
+        {
+            return false;
+        }
+        let mut touched = HashSet::new();
+        for (id, source) in &desired.sources {
+            let before = &old.sources[id];
+            if before.level == source.level {
+                if before != source {
+                    return false;
+                }
+                continue;
+            }
+            let mut probe = before.clone();
+            probe.level = source.level;
+            if probe != *source || (before.level <= 0.0) != (source.level <= 0.0) {
+                return false;
+            }
+            for mid in desired.mixes.keys() {
+                touched.insert((id.clone(), mid.clone()));
+            }
+        }
+        for (key, cell) in &desired.matrix.cells {
+            let before = &old.matrix.cells[key];
+            if before.volume == cell.volume {
+                if before != cell {
+                    return false;
+                }
+                continue;
+            }
+            if before.muted != cell.muted
+                || before.extra != cell.extra
+                || (before.volume <= 0.0) != (cell.volume <= 0.0)
+            {
+                return false;
+            }
+            let Some((id, mid)) = desired.sources.keys().find_map(|id| {
+                let mid = key.strip_prefix(id.as_str())?.strip_prefix('.')?;
+                desired
+                    .mixes
+                    .keys()
+                    .find(|m| m.as_str() == mid)
+                    .map(|m| (id, m))
+            }) else {
+                return false;
+            };
+            touched.insert((id.clone(), mid.clone()));
+        }
+        let mut writes = Vec::new();
+        for (id, mid) in touched {
+            let source = &desired.sources[&id];
+            let cell = desired.matrix.cell(&id, &mid);
+            if cell.volume <= 0.0 {
+                continue; // No route before or after; levels never cross zero here.
+            }
+            let level = cell.volume * source.level;
+            let muted = source.muted || cell.muted || source.level <= 0.0;
+            let key = RouteKey::Cell(id, mid);
+            let Some(route) = self.routes.get_mut(&key) else {
+                return false;
+            };
+            let (Some((identity, applied, was_muted)), Some(node), Ok(true)) =
+                (route.applied.clone(), route.node, route.child.running())
+            else {
+                return false;
+            };
+            if was_muted != muted {
+                return false;
+            }
+            if applied != level {
+                writes.push((key, node, identity, level, muted));
+            }
+        }
+        if writes.is_empty() {
+            return false;
+        }
+        for (key, node, identity, level, muted) in writes {
+            let route = self.routes.get_mut(&key).expect("checked route");
+            if self.backend.set_volume(node, level).is_err() {
+                // The id may be stale; only a snapshot may name it again.
+                route.node = None;
+                return false;
+            }
+            route.applied = Some((identity, level, muted));
+        }
+        true
     }
     fn update(&mut self, revision: u64, desired: Arc<DesiredState>) {
         if self.revision == Some(revision) && Arc::ptr_eq(&self.desired, &desired) {
@@ -1604,6 +1744,7 @@ impl Reconciler {
                     name,
                     owner,
                     applied: None,
+                    node: None,
                     missing: 0,
                 },
             );
@@ -1615,6 +1756,7 @@ impl Reconciler {
             graph.owned(&route.name, &route.owner),
             graph.owned(&cap_name, &route.owner),
         ) else {
+            route.node = None;
             route.missing = route.missing.saturating_add(1);
             if route.missing >= 3 {
                 self.drop_route(&key)?;
@@ -1625,6 +1767,7 @@ impl Reconciler {
         let capture_identity = cap.identity.clone();
         let applied = (node_identity.clone(), level, muted);
         route.missing = 0;
+        route.node = Some(node.id);
         if route.applied.as_ref() != Some(&applied) {
             self.backend.set_level(node.id, level, muted)?;
             route.applied = Some(applied);
@@ -1920,6 +2063,7 @@ impl Reconciler {
                                 ))
                             })?;
                         route.applied = Some((node.identity.clone(), volume * source.level, true));
+                        route.node = Some(node.id);
                     }
                     None => {
                         self.drop_route(&key)?;

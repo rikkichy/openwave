@@ -68,6 +68,9 @@ struct World {
     fail_links: usize,
     fail_moves: usize,
     fail_levels: usize,
+    fail_volumes: usize,
+    level_calls: usize,
+    volume_writes: Vec<(u32, f64)>,
     fail_mutes: usize,
     fail_silence: HashSet<String>,
     fail_terminate: HashSet<String>,
@@ -353,12 +356,25 @@ impl GraphBackend for FakeBackend {
             return Err(failed());
         }
         w.levels.insert(node, (level, muted));
+        w.level_calls += 1;
         for sink in w.sinks.values_mut() {
             if sink["index"] == node {
                 sink["mute"] = json!(muted);
                 sink["volume"]["mono"]["value"] = json!((level * 65536.0).round() as u32);
             }
         }
+        w.mutations += 1;
+        Ok(())
+    }
+    fn set_volume(&mut self, node: u32, level: f64) -> Result<()> {
+        let mut w = self.0.lock().expect("routing fixture lock poisoned");
+        if w.fail_volumes > 0 {
+            w.fail_volumes -= 1;
+            return Err(failed());
+        }
+        w.volume_writes.push((node, level));
+        let muted = w.levels.get(&node).ok_or_else(failed)?.1;
+        w.levels.insert(node, (level, muted));
         w.mutations += 1;
         Ok(())
     }
@@ -443,13 +459,17 @@ impl Fixture {
         Self::with_readiness(CaptureReadiness::default())
     }
     fn with_readiness(readiness: CaptureReadiness) -> Self {
+        Self::with_interval(readiness, Duration::from_millis(10))
+    }
+    /// No timed passes: every full pass is one a test asked for.
+    fn quiet() -> Self {
+        Self::with_interval(CaptureReadiness::default(), Duration::from_secs(60))
+    }
+    fn with_interval(readiness: CaptureReadiness, interval: Duration) -> Self {
         let world = Arc::new(Mutex::new(World::new()));
-        let (mixer, events) = Mixer::start_with_backend(
-            Box::new(FakeBackend(world.clone())),
-            readiness,
-            Duration::from_millis(10),
-        )
-        .unwrap();
+        let (mixer, events) =
+            Mixer::start_with_backend(Box::new(FakeBackend(world.clone())), readiness, interval)
+                .unwrap();
         Self {
             world,
             mixer,
@@ -532,6 +552,22 @@ impl Fixture {
                 "observation did not arrive"
             );
         }
+    }
+    /// Wake full passes until the graph satisfies `predicate` (quiet fixtures).
+    fn converge(&mut self, predicate: impl Fn(&World) -> bool) {
+        for _ in 0..8 {
+            let start = self
+                .world
+                .lock()
+                .expect("routing fixture lock poisoned")
+                .snapshots;
+            self.apply();
+            self.until(|world| world.snapshots > start);
+            if predicate(&self.world.lock().expect("routing fixture lock poisoned")) {
+                return;
+            }
+        }
+        panic!("routing did not converge");
     }
     fn cycles(&self, count: usize) {
         let start = self
@@ -2070,4 +2106,191 @@ fn master_events_follow_proven_identity_observation_and_carry_desired_revision()
             _ => {}
         }
     }
+}
+
+fn retune_fixture() -> Fixture {
+    let mut f = Fixture::quiet();
+    f.app("music", "Music");
+    f.desired.sources.get_mut(&sid("music")).unwrap().level = 0.5;
+    f.cell("music", "personal", 0.8);
+    f.cell("music", "chat", 0.6);
+    f.converge(|w| {
+        w.route(
+            "openwave_src_music",
+            "openwave_personal_mix",
+            Some((0.4, false)),
+        ) && w.route(
+            "openwave_src_music",
+            "openwave_chat_mix",
+            Some((0.3, false)),
+        )
+    });
+    f
+}
+
+#[test]
+fn trim_on_live_routes_writes_one_volume_per_mix_and_no_snapshot() {
+    let mut f = retune_fixture();
+    let (snapshots, level_calls, mutations) = {
+        let w = f.world.lock().unwrap();
+        (w.snapshots, w.level_calls, w.mutations)
+    };
+    f.desired.sources.get_mut(&sid("music")).unwrap().level = 0.25;
+    f.apply();
+    f.until(|w| w.volume_writes.len() >= 2);
+    thread::sleep(Duration::from_millis(50));
+    let w = f.world.lock().unwrap();
+    assert_eq!(
+        w.snapshots, snapshots,
+        "a trim must not rediscover the graph"
+    );
+    assert_eq!(w.level_calls, level_calls, "mute is untouched by a trim");
+    assert_eq!(
+        w.mutations,
+        mutations + 2,
+        "no moves, links, sinks or spawns"
+    );
+    let mut written: Vec<_> = w.volume_writes.iter().map(|(_, level)| *level).collect();
+    written.sort_by(f64::total_cmp);
+    assert_eq!(written, vec![0.15, 0.2]);
+    assert!(w.route(
+        "openwave_src_music",
+        "openwave_personal_mix",
+        Some((0.2, false))
+    ));
+    assert!(w.route(
+        "openwave_src_music",
+        "openwave_chat_mix",
+        Some((0.15, false))
+    ));
+}
+
+#[test]
+fn cell_level_on_a_live_route_is_retuned_in_place() {
+    let mut f = retune_fixture();
+    let snapshots = f.world.lock().unwrap().snapshots;
+    f.cell("music", "chat", 0.2);
+    f.apply();
+    f.until(|w| w.volume_writes.len() == 1);
+    thread::sleep(Duration::from_millis(50));
+    let w = f.world.lock().unwrap();
+    assert_eq!(w.snapshots, snapshots);
+    assert!(w.route(
+        "openwave_src_music",
+        "openwave_chat_mix",
+        Some((0.1, false))
+    ));
+    assert!(w.route(
+        "openwave_src_music",
+        "openwave_personal_mix",
+        Some((0.4, false))
+    ));
+}
+
+#[test]
+fn trim_reaching_zero_takes_the_full_pass_and_silences() {
+    let mut f = retune_fixture();
+    let snapshots = f.world.lock().unwrap().snapshots;
+    f.desired.sources.get_mut(&sid("music")).unwrap().level = 0.0;
+    f.apply();
+    f.until(|w| {
+        w.snapshots > snapshots
+            && w.route(
+                "openwave_src_music",
+                "openwave_personal_mix",
+                Some((0.0, true)),
+            )
+            && w.route("openwave_src_music", "openwave_chat_mix", Some((0.0, true)))
+    });
+    assert!(f.world.lock().unwrap().volume_writes.is_empty());
+}
+
+#[test]
+fn cell_reaching_zero_takes_the_full_pass_and_drops_the_route() {
+    let mut f = retune_fixture();
+    f.cell("music", "chat", 0.0);
+    f.apply();
+    f.until(|w| !w.route("openwave_src_music", "openwave_chat_mix", None));
+    assert!(f.world.lock().unwrap().volume_writes.is_empty());
+}
+
+#[test]
+fn mute_alongside_a_trim_takes_the_full_pass() {
+    let mut f = retune_fixture();
+    let source = f.desired.sources.get_mut(&sid("music")).unwrap();
+    source.level = 0.25;
+    source.muted = true;
+    f.apply();
+    f.until(|w| {
+        w.route(
+            "openwave_src_music",
+            "openwave_personal_mix",
+            Some((0.2, true)),
+        )
+    });
+    assert!(f.world.lock().unwrap().volume_writes.is_empty());
+}
+
+#[test]
+fn failed_retune_write_falls_back_to_the_full_pass() {
+    let mut f = retune_fixture();
+    let snapshots = f.world.lock().unwrap().snapshots;
+    f.world.lock().unwrap().fail_volumes = 1;
+    f.desired.sources.get_mut(&sid("music")).unwrap().level = 0.25;
+    f.apply();
+    f.until(|w| {
+        w.snapshots > snapshots
+            && w.route(
+                "openwave_src_music",
+                "openwave_personal_mix",
+                Some((0.2, false)),
+            )
+            && w.route(
+                "openwave_src_music",
+                "openwave_chat_mix",
+                Some((0.15, false)),
+            )
+    });
+}
+
+#[test]
+fn dead_route_child_is_never_retuned() {
+    let mut f = retune_fixture();
+    {
+        let mut w = f.world.lock().unwrap();
+        let personal = w.node_id(&routing::cell_route_name(&sid("music"), &mid("personal")));
+        let child = *w
+            .children
+            .iter()
+            .find(|(_, ids)| Some(ids[0]) == personal)
+            .unwrap()
+            .0;
+        w.children.remove(&child);
+    }
+    let snapshots = f.world.lock().unwrap().snapshots;
+    f.desired.sources.get_mut(&sid("music")).unwrap().level = 0.25;
+    f.apply();
+    f.until(|w| w.snapshots > snapshots);
+    assert!(f.world.lock().unwrap().volume_writes.is_empty());
+}
+
+#[test]
+fn retuned_revision_is_verified_by_a_later_full_pass() {
+    let mut f = Fixture::with_interval(CaptureReadiness::default(), Duration::from_millis(400));
+    f.app("music", "Music");
+    f.cell("music", "personal", 0.8);
+    f.apply();
+    f.until(|w| {
+        w.route(
+            "openwave_src_music",
+            "openwave_personal_mix",
+            Some((0.8, false)),
+        )
+    });
+    f.desired.sources.get_mut(&sid("music")).unwrap().level = 0.5;
+    f.apply();
+    f.until(|w| w.volume_writes.len() == 1);
+    let revision = f.revision;
+    let observed = f.observation(|o| o.revision == revision);
+    assert!(observed.errors.is_empty());
 }

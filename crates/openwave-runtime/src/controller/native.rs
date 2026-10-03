@@ -978,6 +978,9 @@ mod tests {
             fn set_level(&mut self, _: u32, _: f64, _: bool) -> Result<()> {
                 panic!("no mix masters or routes")
             }
+            fn set_volume(&mut self, _: u32, _: f64) -> Result<()> {
+                panic!("no routes")
+            }
             fn set_capture_mute(&mut self, _: &CaptureSnapshot, _: bool) -> Result<()> {
                 panic!("no hardware captures")
             }

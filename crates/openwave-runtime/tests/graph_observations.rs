@@ -96,6 +96,9 @@ impl GraphBackend for ScriptedGraph {
     fn set_level(&mut self, _: u32, _: f64, _: bool) -> Result<()> {
         panic!("unexpected level")
     }
+    fn set_volume(&mut self, _: u32, _: f64) -> Result<()> {
+        panic!("unexpected volume")
+    }
     fn spawn_loopback(
         &mut self,
         _: &str,
