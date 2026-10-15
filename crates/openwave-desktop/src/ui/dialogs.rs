@@ -484,14 +484,22 @@ struct Bindings {
     list: gtk::ListBox,
     names: RefCell<Vec<String>>,
     pending: adw::EntryRow,
+    name: adw::EntryRow,
     confirm: gtk::glib::WeakRef<gtk::Button>,
+}
+/// An application source may have no bindings (streams can still be routed to its sink
+/// explicitly); it only needs a name, typed or defaulted from its first binding.
+fn can_save_app_source(name: &str, names: &[String], pending: &str) -> bool {
+    !name.trim().is_empty() || !names.is_empty() || !pending.trim().is_empty()
 }
 impl Bindings {
     fn valid(&self) {
         if let Some(confirm) = self.confirm.upgrade() {
-            confirm.set_sensitive(
-                !self.names.borrow().is_empty() || !self.pending.text().trim().is_empty(),
-            );
+            confirm.set_sensitive(can_save_app_source(
+                &self.name.text(),
+                &self.names.borrow(),
+                &self.pending.text(),
+            ));
         }
     }
     fn add(self: &Rc<Self>, text: &str) {
@@ -578,6 +586,7 @@ fn source_config(
             list,
             names: RefCell::new(source.match_app_names.clone()),
             pending: pending.clone(),
+            name: name.clone(),
             confirm: save.downgrade(),
         });
         let weak = Rc::downgrade(&bindings);
@@ -596,12 +605,14 @@ fn source_config(
                 b.pending.set_text("");
             }
         });
-        let weak = Rc::downgrade(&bindings);
-        pending.connect_changed(move |_| {
-            if let Some(b) = weak.upgrade() {
-                b.valid();
-            }
-        });
+        for entry in [&pending, &name] {
+            let weak = Rc::downgrade(&bindings);
+            entry.connect_changed(move |_| {
+                if let Some(b) = weak.upgrade() {
+                    b.valid();
+                }
+            });
+        }
         let running = gtk::MenuButton::builder()
             .label("From running apps")
             .halign(gtk::Align::Start)
@@ -663,9 +674,6 @@ fn source_config(
             b.add(&text);
             b.names.borrow().clone()
         });
-        if names.as_ref().is_some_and(Vec::is_empty) {
-            return;
-        }
         let text = name.text().trim().to_owned();
         let text = if text.is_empty() {
             names
@@ -711,6 +719,18 @@ fn source_config(
 mod tests {
     use super::*;
     use crate::ui::test_support::{Rig, descendants, icons};
+
+    #[test]
+    fn app_source_saves_with_a_name_and_no_bindings() {
+        let none: [String; 0] = [];
+        assert!(can_save_app_source("Work", &none, ""));
+        assert!(can_save_app_source("", &["Player".into()], ""));
+        assert!(can_save_app_source("", &none, "  Player  "));
+        assert!(
+            !can_save_app_source("  ", &none, " "),
+            "nothing supplies a name"
+        );
+    }
 
     #[test]
     #[ignore = "requires the isolated installed GTK test runner"]
