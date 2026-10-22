@@ -61,7 +61,7 @@ fn run(arguments: Arguments) -> Result<()> {
             "Starting OpenWave audio daemon (auto-recover: {})",
             arguments.auto_recover
         );
-        let mut audio = AudioManager::start()?;
+        let mut audio = AudioManager::start(arguments.auto_recover)?;
         let readiness = audio.readiness();
         let mut health = match HealthMonitor::start(
             arguments.auto_recover,

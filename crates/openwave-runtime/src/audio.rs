@@ -24,6 +24,9 @@ const STARTUP: Duration = Duration::from_secs(1);
 const WEDGE: Duration = Duration::from_secs(3);
 const SILENCE: Duration = Duration::from_secs(30);
 const MUTE_RECHECK: Duration = Duration::from_secs(5);
+/// With --auto-recover, at most one USB reset per unit in this window; after
+/// that the existing "power-cycle the device" error stands.
+const RESET_INTERVAL: Duration = Duration::from_secs(600);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PinStatus {
@@ -79,6 +82,10 @@ impl PinWatch {
     }
     pub fn status(&self) -> PinStatus {
         self.status
+    }
+    /// The keepalive has received capture data since it (re)started.
+    pub fn received(&self) -> bool {
+        self.received
     }
     pub fn step(
         &mut self,
@@ -382,14 +389,16 @@ pub struct AudioManager {
     join: Option<JoinHandle<Result<()>>>,
 }
 impl AudioManager {
-    pub fn start() -> Result<Self> {
+    /// `auto_recover` additionally permits a USB reset of a Wave XLR whose
+    /// capture delivers digital silence.
+    pub fn start(auto_recover: bool) -> Result<Self> {
         let cancel = Arc::new(AtomicBool::new(false));
         let readiness = CaptureReadiness::default();
         let (wake, receiver) = mpsc::channel();
         let (worker_cancel, worker_bank) = (cancel.clone(), readiness.clone());
         let join = thread::Builder::new()
             .name("openwave-audio".into())
-            .spawn(move || audio_loop(worker_cancel, worker_bank, receiver))?;
+            .spawn(move || audio_loop(worker_cancel, worker_bank, receiver, auto_recover))?;
         Ok(Self {
             cancel,
             wake,
@@ -420,8 +429,12 @@ fn audio_loop(
     cancel: Arc<AtomicBool>,
     bank: CaptureReadiness,
     wake: mpsc::Receiver<()>,
+    auto_recover: bool,
 ) -> Result<()> {
     let runner = CommandRunner::new(cancel.clone());
+    let guard = crate::guard::PlaybackGuard::start();
+    let mut last_status: HashMap<String, PinStatus> = HashMap::new();
+    let mut last_reset: HashMap<String, Instant> = HashMap::new();
     let mut pins: HashMap<String, Pin> = HashMap::new();
     let mut dormant: HashMap<String, PinWatch> = HashMap::new();
     let mut previous = None;
@@ -498,7 +511,37 @@ fn audio_loop(
         }
         for pin in pins.values_mut() {
             let alive = pin.observe();
-            if pin.watch.step(now, alive, true, pin.node.muted) == PinAction::Restart {
+            let action = pin.watch.step(now, alive, true, pin.node.muted);
+            if pin.watch.received() {
+                guard.capture_running(&pin.node.name);
+            }
+            let status = pin.watch.status();
+            let entered_silence = last_status.insert(pin.node.name.clone(), status)
+                != Some(PinStatus::Silent)
+                && status == PinStatus::Silent;
+            if auto_recover
+                && entered_silence
+                && crate::guard::node_serial(&pin.node.name).is_some()
+                && last_reset
+                    .get(&pin.node.name)
+                    .is_none_or(|at| now.saturating_duration_since(*at) >= RESET_INTERVAL)
+            {
+                // Digital silence on a Wave XLR is the shared-clock wedge.
+                // Recycling the keepalive can't clear it; a reset can, with the
+                // playback guard holding apps off the output meanwhile.
+                last_reset.insert(pin.node.name.clone(), now);
+                match crate::guard::reset_unit(&pin.node.name) {
+                    Ok(()) => log::warn!(
+                        "Capture {} delivers digital silence; reset the device",
+                        pin.node.name
+                    ),
+                    Err(error) => {
+                        log::error!("Resetting the device behind {}: {error}", pin.node.name)
+                    }
+                }
+                continue;
+            }
+            if action == PinAction::Restart {
                 log::warn!(
                     "Capture {} {:?}; recycling owned keepalive",
                     pin.node.name,

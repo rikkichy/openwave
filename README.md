@@ -216,7 +216,7 @@ openwave-daemon --version
 # openwave-daemon --auto-recover  # explicitly permits bounded disruptive remedies
 ```
 
-Do not start a second daemon beside the installed service. `--auto-recover` permits bounded card-profile cycles and sink suspend/resume on confirmed faults; it does not promise to repair every silent device. Capture xruns and no-data faults share a recovery budget; muted, unknown, absent or recreated observations cannot refill it. See [troubleshooting](docs/troubleshooting.md).
+Do not start a second daemon beside the installed service. `--auto-recover` permits bounded card-profile cycles and sink suspend/resume on confirmed faults, and one USB reset per 10 minutes of a Wave XLR whose capture delivers digital silence; it does not promise to repair every silent device. Capture xruns and no-data faults share a recovery budget; muted, unknown, absent or recreated observations cannot refill it. See [troubleshooting](docs/troubleshooting.md).
 
 ### Uninstall
 

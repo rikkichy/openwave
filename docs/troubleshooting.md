@@ -59,6 +59,36 @@ Suspending/resuming the affected sink or cycling its card profile is disruptive 
 
 Meters preserve the Python mono-downmix policy and settle to zero below a `0.004` PCM quiet floor. A low meter reading is not proof that a published mix is silent; source/send/master volume coordinates have a cubic PCM boundary. Anti-phase stereo can cancel in a mono meter even when individual channels contain signal.
 
+## Capture silent after a wake or replug (Wave XLR)
+
+The Wave XLR runs capture and playback from one clock. If playback starts
+before capture after the unit reappears, capture delivers digital silence
+until the unit loses power or is reset. This happens most often when the
+unit sits on a hub that drops on suspend (a monitor or KVM) and an
+application, such as a browser tab, keeps a playback stream open: PipeWire
+reconnects that stream to the new sink seconds before the keepalive opens
+capture.
+
+The daemon's playback guard prevents this. When the Wave XLR sink disappears
+it moves the streams that were playing to it onto a temporary
+`openwave-hold` sink, and moves them back once the keepalive reports capture
+data, usually a few seconds after the unit returns. Those applications are
+silent for that time. Holds end after at most 30 s if the unit doesn't come
+back, and 10 s after it does. The daemon log shows each step:
+
+```bash
+journalctl --user -u openwave | grep -E 'Output .* (disappeared|is back|appeared)|Released output'
+```
+
+If capture is already silent (the guard wasn't running, or another cause),
+a replug clears it. With `--auto-recover`, the daemon instead USB-resets the
+Wave XLR once the keepalive reports digital silence, at most once per 10
+minutes, and the guard keeps playback off the output while it comes back.
+
+To check the start order yourself, compare `trigger_time` in
+`/proc/asound/<card>/pcm0p/sub0/status` (playback) and `pcm0c` (capture):
+capture should be the earlier of the two.
+
 ## Capture keepalive and health policy
 
 The native daemon maintains one capture pin per supported Wave input and releases pins on shutdown. The mixer separately confirms raw capture readiness before Wave playback. Owned keepalive restart is normal operation, separate from permission to cycle hardware profiles.
