@@ -723,3 +723,101 @@ fn recall_supersedes_only_its_pending_cell_and_device_fields() {
     assert_eq!(matrix["b.personal"]["volume"], 0.3);
     assert_eq!(matrix["b.personal"]["muted"], true);
 }
+
+fn remembered(f: &Fixture) -> Value {
+    f.read("devices.json")["devices"].clone()
+}
+fn retire(f: &Fixture, unit: &UnitSnapshot) {
+    f.incoming.send(BackendEvent::UnitRetired(unit.id)).unwrap();
+    f.wait_snapshot(|snapshot| snapshot.units.is_empty());
+}
+fn with_state(unit: &UnitSnapshot, change: impl FnOnce(&mut DeviceState)) -> UnitSnapshot {
+    let mut unit = unit.clone();
+    let Observation::Known(state) = &mut unit.state else {
+        panic!("fixture unit has a known state");
+    };
+    change(state);
+    unit
+}
+const REMEMBERED_A: &str = r#"{"devices":{"wave_xlr:A":{"gain_raw":2560,"hp_volume_db":-18.5,"low_impedance":true,"monitor_mix":0}}}"#;
+
+#[test]
+fn remembered_settings_are_reasserted_before_a_reconnected_unit_is_remembered_again() {
+    let f = Fixture::new(
+        json!({"name":"Recall"}),
+        Some(("devices.json", REMEMBERED_A)),
+    );
+    // A power-cycled unit reports firmware defaults: gain 1280, -12 dB, low-Z off, mix 0.
+    let a = unit(ProfileId::WaveXlr, 1, "A", false);
+    f.connect(std::slice::from_ref(&a), false);
+    let job = f.job();
+    assert_eq!(job.1, a.id);
+    assert_eq!(
+        job.2,
+        vec![
+            DeviceSetting::GainRaw(2560),
+            DeviceSetting::HeadphoneDb(-18.5),
+            DeviceSetting::LowImpedance(true),
+        ]
+    );
+    // Polls before the restore completes neither re-queue nor replace the memory.
+    f.incoming.send(BackendEvent::Unit(a.clone())).unwrap();
+    f.finish_job(&job, false);
+    // After the restore, physical changes such as a knob move are remembered.
+    let knob = with_state(&a, |state| {
+        state.gain_raw = 2560;
+        state.hp_volume_db = -18.5;
+        state.low_impedance = Some(true);
+        state.monitor_mix = Some(0x14d5);
+    });
+    f.incoming.send(BackendEvent::Unit(knob)).unwrap();
+    retire(&f, &a);
+    assert_eq!(
+        remembered(&f),
+        json!({"wave_xlr:A":{"gain_raw":2560,"hp_volume_db":-18.5,"low_impedance":true,"monitor_mix":0x14d5}})
+    );
+    assert!(
+        f.outgoing
+            .try_iter()
+            .all(|command| !matches!(command, BackendCommand::Device { .. }))
+    );
+}
+
+#[test]
+fn failed_restore_keeps_the_remembered_settings() {
+    let f = Fixture::new(
+        json!({"name":"Recall"}),
+        Some(("devices.json", REMEMBERED_A)),
+    );
+    let a = unit(ProfileId::WaveXlr, 1, "A", false);
+    f.connect(std::slice::from_ref(&a), false);
+    let job = f.job();
+    f.finish_job(&job, true);
+    f.incoming.send(BackendEvent::Unit(a.clone())).unwrap();
+    retire(&f, &a);
+    assert_eq!(
+        f.read("devices.json"),
+        serde_json::from_str::<Value>(REMEMBERED_A).unwrap()
+    );
+}
+
+#[test]
+fn new_units_are_remembered_without_mute_or_phantom_and_unserialed_units_are_ignored() {
+    let f = Fixture::new(json!({"name":"Recall"}), None);
+    let a = unit(ProfileId::WaveXlr, 1, "A", true);
+    let anonymous = unit(ProfileId::Wave3, 2, "", false);
+    f.connect(&[a.clone(), anonymous.clone()], false);
+    f.incoming
+        .send(BackendEvent::UnitRetired(anonymous.id))
+        .unwrap();
+    retire(&f, &a);
+    assert_eq!(
+        remembered(&f),
+        json!({"wave_xlr:A":{"gain_raw":1280,"hp_volume_db":-12.0,"low_impedance":false,"monitor_mix":0}})
+    );
+    assert!(
+        f.outgoing
+            .try_iter()
+            .all(|command| !matches!(command, BackendCommand::Device { .. }))
+    );
+}

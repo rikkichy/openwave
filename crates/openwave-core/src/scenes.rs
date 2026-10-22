@@ -4,8 +4,9 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
-use crate::model::{ErrorCode, OperationError, OperationIssue, Result, UnitId};
+use crate::model::{DeviceSetting, ErrorCode, OperationError, OperationIssue, Result, UnitId};
 use crate::profiles::ProfileId;
+use crate::protocol::DeviceState;
 
 /// Existing store IDs are opaque nonempty strings, not newly generated slugs.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
@@ -338,6 +339,99 @@ pub fn encode_store(scenes: &IndexMap<SceneId, Scene>) -> Result<Value> {
     let mut root = Map::new();
     root.insert("scenes".into(), serde_json::to_value(scenes)?);
     Ok(Value::Object(root))
+}
+
+/// Last settings observed on each serial-identified unit, keyed like scene
+/// hardware entries (`profile:serial`). They are reasserted when that unit
+/// appears, because the firmware forgets them when it loses power.
+pub type RememberedHardware = IndexMap<String, HardwarePatch>;
+
+pub fn decode_remembered(value: Value) -> Result<RememberedHardware> {
+    let mut root = mapping(value, "device store")?;
+    let devices = root
+        .remove("devices")
+        .ok_or_else(|| OperationError::invalid("device store needs devices"))?;
+    unsupported(&root, "device store")?;
+    mapping(devices, "devices")?
+        .into_iter()
+        .map(|(key, value)| {
+            if key.is_empty() {
+                return Err(OperationError::invalid("device key must be nonempty"));
+            }
+            Ok((key, HardwarePatch::from_value(value)?))
+        })
+        .collect()
+}
+
+pub fn encode_remembered(devices: &RememberedHardware) -> Result<Value> {
+    for patch in devices.values() {
+        patch.validate()?;
+    }
+    let mut root = Map::new();
+    root.insert("devices".into(), serde_json::to_value(devices)?);
+    Ok(Value::Object(root))
+}
+
+/// The settings worth reasserting after a power cycle. Mute is owned by the
+/// source rows and 48 V phantom power is never changed automatically.
+pub fn remembered_patch(profile: ProfileId, state: &DeviceState) -> HardwarePatch {
+    let p = profile.profile();
+    HardwarePatch {
+        gain_raw: Some(state.gain_raw),
+        mute: None,
+        hp_volume_db: Some(state.hp_volume_db),
+        low_impedance: if p.has_low_z() {
+            state.low_impedance
+        } else {
+            None
+        },
+        monitor_mix: if p.has_monitor_mix() {
+            state.monitor_mix
+        } else {
+            None
+        },
+    }
+}
+
+/// Writes needed to return an observed unit to its remembered settings.
+/// Unsupported, out-of-range and already-matching fields are omitted, and a
+/// remembered mute is ignored for the same reason it is never recorded.
+pub fn restore_settings(
+    profile: ProfileId,
+    remembered: &HardwarePatch,
+    observed: &DeviceState,
+    gain_locked: bool,
+) -> Vec<DeviceSetting> {
+    let p = profile.profile();
+    let mut settings = Vec::new();
+    if let Some(gain) = remembered.gain_raw
+        && !gain_locked
+        && gain <= p.gain_max
+        && gain != observed.gain_raw
+    {
+        settings.push(DeviceSetting::GainRaw(gain));
+    }
+    if let Some(db) = remembered.hp_volume_db
+        && db.is_finite()
+        && (p.hp_min_db()..=0.0).contains(&db)
+        && db != observed.hp_volume_db
+    {
+        settings.push(DeviceSetting::HeadphoneDb(db));
+    }
+    if let Some(low_z) = remembered.low_impedance
+        && p.has_low_z()
+        && Some(low_z) != observed.low_impedance
+    {
+        settings.push(DeviceSetting::LowImpedance(low_z));
+    }
+    if let Some(mix) = remembered.monitor_mix
+        && p.has_monitor_mix()
+        && mix <= p.mix_max
+        && Some(mix) != observed.monitor_mix
+    {
+        settings.push(DeviceSetting::MonitorMix(mix));
+    }
+    settings
 }
 
 pub fn hardware_key(profile: ProfileId, serial: &str) -> String {

@@ -107,6 +107,10 @@ Hardware matching uses exact serial identity. A legacy model-only scene entry ca
 
 [`Controller::apply_scene`](../crates/openwave-runtime/src/controller/state/scene.rs) performs ordered, best-effort recall through the same source/group rules as live controls. Explicit source mute patches take precedence over hardware mute patches; hardware-only mute fills missing bound-row patches, then the final committed group state determines hardware mute. A later recalled open group member wins, and displaced entries are reported. Superseded unsent edits are cancelled so they cannot overwrite the recalled state. Hardware operations go to captured per-device queues; completion waits for their results. Some changes can succeed while others fail. The result reports skipped/failed targets; it does not promise rollback, sample-accurate switching or a hardware-atomic transaction. Do not treat an action being accepted as proof every target has completed successfully.
 
+### Remembered device settings
+
+Wave firmware forgets its settings when it loses power, for example after a longer suspend or a KVM switch. The controller remembers the last observed gain, headphone volume, low impedance mode and monitor mix of each unit with a unique, nonempty serial, keyed like scene hardware entries, in `devices.json`. When a unit's first known state arrives, at startup or after a reconnect, the controller queues only the fields that differ, through the same device queue as scenes. Only after that job succeeds, or when nothing is owed, do later observations (including physical knob moves) replace the remembered entry, so a power-cycled unit's defaults never overwrite it. A failed restore keeps the entry, and the next connection retries. Mute is never reasserted because source rows own it, phantom power is never written automatically, and the selected unit's gain lock is honored. Changes are written at most every two seconds and on unit removal or shutdown, never after removal has begun. This is always enabled; another host that changed the same unit in between is overridden.
+
 ## DSP and calibration
 
 [`openwave_core::effects`](../crates/openwave-core/src/effects.rs) validates settings and renders JSON-escaped SPA configuration independently of GTK and subprocess execution. The mixer owns the resulting PipeWire filter process/lifecycle. User-visible labels must not become unescaped SPA syntax or shell commands.
@@ -128,6 +132,7 @@ Under the OpenWave configuration directory (normally `~/.config/openwave`):
 | `mixes.json` | Per-send levels/mutes, per-mix output choices and masters |
 | `ui-state.json` | Window geometry and interface preferences |
 | `scenes.json` | Named level snapshots and serial-bound hardware settings |
+| `devices.json` | Last observed gain, headphone volume, low impedance and monitor mix per serial-identified unit, reasserted when that unit appears |
 
 Scene storage is managed through the scene interface. The generated per-user PipeWire mix configuration is audio integration state, not an external control protocol. Source definitions and send levels are deliberately separate so a fader save cannot overwrite topology. Invalid persistent data is not an invitation to overwrite it with defaults.
 

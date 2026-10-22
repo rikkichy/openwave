@@ -21,7 +21,7 @@ OpenWave enables exact VID:PID profiles, not a family-wide match on the word “
 | Headphone volume | Signed Q8.8 dB | Signed Q8.8 dB | −60 to 0 dB, quarter-dB steps |
 | 48 V phantom power | Yes, config byte 6 | No | Yes, settings byte 1 bit 1 |
 | Low impedance mode | Yes | No | Yes |
-| Microphone/PC monitor mix | No | Yes, 0–100% | Yes, 0–200 raw (0 = mic, 200 = PC) |
+| Microphone/PC monitor mix | `007d`: yes, 0–100% (0 = PC, 100 = mic), config bytes 12–13; `00a6`: no | Yes, 0–100% | Yes, 0–200 raw (0 = mic, 200 = PC) |
 | Knob mode, firmware/API/serial, meters | Profile-defined | Profile-defined | No physical knob; USB descriptor serial; firmware/API unavailable; PCM meters |
 
 Controls absent from a profile are hidden, not emulated. Profile capabilities also govern ALSA synchronization; ALSA control names/ranges are discovered instead of assuming fixed numeric control IDs. [`openwave_core::protocol`](../crates/openwave-core/src/protocol.rs) validates profile fields and exact identity matches; [`openwave_runtime::device`](../crates/openwave-runtime/src/device.rs) owns USB access and ALSA synchronization.

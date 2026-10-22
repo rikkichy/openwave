@@ -9,6 +9,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Coalesces knob sweeps into one `devices.json` write.
+const REMEMBER_DELAY: Duration = Duration::from_secs(2);
+
 mod calibration;
 mod mutations;
 mod mutes;
@@ -85,6 +88,13 @@ struct Controller {
     silent_sources: HashMap<SourceId, NodeIdentity>,
     binding_epoch: u64,
     intents: HashMap<(UnitId, SettingField), (CommandId, DeviceSetting)>,
+    /// Units whose observations update the remembered settings. A unit joins
+    /// only after its remembered settings were reasserted (or none were owed),
+    /// so a power-cycled unit's defaults never overwrite what was remembered.
+    learning: HashSet<UnitId>,
+    restoring: HashMap<UnitId, u64>,
+    remember_pending: IndexMap<String, scenes::HardwarePatch>,
+    remember_due: Option<Instant>,
     meter_targets: HashMap<String, NodeIdentity>,
     meter_specs: Vec<MeterTarget>,
     observed_mixes: IndexMap<MixId, NodeIdentity>,
@@ -210,6 +220,10 @@ impl Controller {
             bindings: IndexMap::new(),
             binding_epoch: 0,
             intents: HashMap::new(),
+            learning: HashSet::new(),
+            restoring: HashMap::new(),
+            remember_pending: IndexMap::new(),
+            remember_due: None,
             capture_intents: HashMap::new(),
             capture_baselines: HashMap::new(),
             held_captures: HashMap::new(),
@@ -258,6 +272,9 @@ impl Controller {
                     self.apply(edit.id, edit.command);
                 }
             }
+            if self.remember_due.is_some_and(|due| due <= now) {
+                self.flush_remembered();
+            }
             self.publish();
             let wait = self
                 .pending
@@ -272,6 +289,7 @@ impl Controller {
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
+        self.flush_remembered();
         let mut admission = self
             .shared
             .admission
@@ -859,7 +877,89 @@ impl Controller {
                 }
             }
         }
+        self.remember_or_restore(id);
         self.sync_unit_view();
+    }
+    /// Only an exact serial that is unique among connected units is trusted.
+    fn remembered_key(&self, id: UnitId) -> Option<String> {
+        let serial = &self.units.get(&id)?.info.serial;
+        if serial.is_empty() {
+            return None;
+        }
+        let duplicates = self
+            .units
+            .values()
+            .filter(|unit| unit.id.profile == id.profile && unit.info.serial == *serial)
+            .count();
+        (duplicates == 1).then(|| scenes::hardware_key(id.profile, serial))
+    }
+    /// The first known state of a connection reasserts the remembered settings;
+    /// later states, including physical knob moves, replace them.
+    fn remember_or_restore(&mut self, id: UnitId) {
+        if self.frozen || self.restoring.contains_key(&id) {
+            return;
+        }
+        let Some(state) = self
+            .units
+            .get(&id)
+            .and_then(|unit| unit.state.known())
+            .cloned()
+        else {
+            return;
+        };
+        let Some(key) = self.remembered_key(id) else {
+            return;
+        };
+        let remembered = self
+            .remember_pending
+            .get(&key)
+            .or_else(|| self.store.devices.value().get(&key));
+        if !self.learning.contains(&id) {
+            let gain_locked =
+                self.view.selected_unit == Some(id) && self.view.preferences.gain_locked;
+            let settings = remembered
+                .map(|patch| scenes::restore_settings(id.profile, patch, &state, gain_locked))
+                .unwrap_or_default();
+            if settings.is_empty() {
+                // Nothing is owed, so this first state is already worth remembering.
+                self.learning.insert(id);
+            } else {
+                let job = self.next_job;
+                match self.queue_device(None, id, settings) {
+                    Ok(()) if self.jobs.contains_key(&job) => {
+                        self.restoring.insert(id, job);
+                    }
+                    Ok(()) => {
+                        self.learning.insert(id);
+                    }
+                    // Stay out of learning: a later reconnect retries the restore.
+                    Err(error) => self.issue(format!("restore {key}"), error),
+                }
+                return;
+            }
+        }
+        let patch = scenes::remembered_patch(id.profile, &state);
+        if remembered != Some(&patch) {
+            self.remember_pending.insert(key, patch);
+            self.remember_due
+                .get_or_insert_with(|| Instant::now() + REMEMBER_DELAY);
+        }
+    }
+    fn flush_remembered(&mut self) {
+        self.remember_due = None;
+        if self.remember_pending.is_empty() {
+            return;
+        }
+        // Removal must not recreate settings; a read-only store is reported at load.
+        if self.frozen || !self.store.devices.writable() {
+            self.remember_pending.clear();
+            return;
+        }
+        let mut devices = self.store.devices.value().clone();
+        devices.extend(self.remember_pending.drain(..));
+        if let Err(error) = self.store.devices.replace(devices) {
+            self.issue("devices", error);
+        }
     }
     fn observe(&mut self, event: BackendEvent) {
         match event {
@@ -867,6 +967,9 @@ impl Controller {
             BackendEvent::UnitRetired(unit) => {
                 self.retired.insert(unit);
                 self.units.shift_remove(&unit);
+                self.learning.remove(&unit);
+                self.restoring.remove(&unit);
+                self.flush_remembered();
                 self.cancel_pending(
                     |key| matches!(key, PendingKey::Device(target, _) if *target == unit),
                 );
@@ -887,6 +990,12 @@ impl Controller {
                 let Some(owned) = self.jobs.remove(&job) else {
                     return;
                 };
+                if self.restoring.get(&owned.unit) == Some(&job) {
+                    self.restoring.remove(&owned.unit);
+                    if owned.unit == unit && result.is_ok() {
+                        self.learning.insert(unit);
+                    }
+                }
                 if owned.unit != unit {
                     if let Some(snapshot) = self.units.get_mut(&owned.unit) {
                         snapshot.state = Observation::Unknown(OperationError::new(

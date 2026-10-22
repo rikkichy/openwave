@@ -316,3 +316,96 @@ fn legacy_resolution_counts_serialless_units_and_never_crosses_profiles() {
         "wave_xlr_mk2:a:b"
     );
 }
+
+mod remembered {
+    use openwave_core::{
+        model::DeviceSetting,
+        profiles::ProfileId,
+        protocol::ConfigBuffer,
+        scenes::{
+            HardwarePatch, decode_remembered, encode_remembered, remembered_patch, restore_settings,
+        },
+    };
+    use serde_json::json;
+
+    fn defaults(profile: ProfileId) -> openwave_core::protocol::DeviceState {
+        let len = profile.profile().legacy.unwrap().config_len;
+        ConfigBuffer::decode(profile, &vec![0; len])
+            .unwrap()
+            .state()
+    }
+
+    #[test]
+    fn records_capabilities_but_never_mute_or_phantom() {
+        let mut state = defaults(ProfileId::WaveXlr);
+        state.muted = true;
+        state.phantom = Some(true);
+        state.monitor_mix = Some(0x14d5);
+        let patch = remembered_patch(ProfileId::WaveXlr, &state);
+        assert_eq!(patch.mute, None);
+        assert_eq!(patch.low_impedance, Some(false));
+        assert_eq!(patch.monitor_mix, Some(0x14d5));
+        let mk2 = remembered_patch(ProfileId::WaveXlrMk2, &defaults(ProfileId::WaveXlrMk2));
+        assert_eq!(mk2.monitor_mix, None);
+        let wave3 = remembered_patch(ProfileId::Wave3, &defaults(ProfileId::Wave3));
+        assert_eq!(wave3.low_impedance, None);
+    }
+
+    #[test]
+    fn restore_writes_only_differing_supported_in_range_fields() {
+        let observed = defaults(ProfileId::WaveXlr);
+        let wanted = HardwarePatch {
+            gain_raw: Some(0x3840),
+            mute: Some(true),
+            hp_volume_db: Some(-18.5),
+            low_impedance: Some(true),
+            monitor_mix: Some(0),
+        };
+        assert_eq!(
+            restore_settings(ProfileId::WaveXlr, &wanted, &observed, false),
+            vec![
+                DeviceSetting::GainRaw(0x3840),
+                DeviceSetting::HeadphoneDb(-18.5),
+                DeviceSetting::LowImpedance(true),
+            ]
+        );
+        assert_eq!(
+            restore_settings(ProfileId::WaveXlr, &wanted, &observed, true),
+            vec![
+                DeviceSetting::HeadphoneDb(-18.5),
+                DeviceSetting::LowImpedance(true),
+            ]
+        );
+        let out_of_range = HardwarePatch {
+            gain_raw: Some(u16::MAX),
+            monitor_mix: Some(0x6401),
+            hp_volume_db: Some(-200.0),
+            ..HardwarePatch::default()
+        };
+        assert!(restore_settings(ProfileId::WaveXlr, &out_of_range, &observed, false).is_empty());
+        let mix_only = HardwarePatch {
+            monitor_mix: Some(0x3200),
+            ..HardwarePatch::default()
+        };
+        assert!(
+            restore_settings(
+                ProfileId::WaveXlrMk2,
+                &mix_only,
+                &defaults(ProfileId::WaveXlrMk2),
+                false
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn store_round_trips_and_rejects_unknown_or_empty_keys() {
+        let value = json!({"devices":{"wave_xlr:A":{"gain_raw":2560,"low_impedance":true,"monitor_mix":0}}});
+        let devices = decode_remembered(value.clone()).unwrap();
+        assert_eq!(encode_remembered(&devices).unwrap(), value);
+        assert!(decode_remembered(json!({})).is_err());
+        assert!(decode_remembered(json!({"devices":{},"extra":1})).is_err());
+        assert!(decode_remembered(json!({"devices":{"":{}}})).is_err());
+        assert!(decode_remembered(json!({"devices":{"wave_xlr:A":{"phantom":true}}})).is_err());
+    }
+}

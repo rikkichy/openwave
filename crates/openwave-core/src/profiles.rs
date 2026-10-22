@@ -159,7 +159,16 @@ const XLR: DeviceProfile = DeviceProfile {
 };
 
 pub static PROFILES: [DeviceProfile; 4] = [
-    XLR,
+    // Only 007d has a verified monitor-mix field. 00a6 shares the base layout
+    // through `..XLR` and keeps the mix disabled until it has its own evidence.
+    DeviceProfile {
+        legacy: Some(LegacyProfile {
+            off_monitor_mix: Some(12),
+            ..XLR_LEGACY
+        }),
+        mix_max: 0x6400,
+        ..XLR
+    },
     DeviceProfile {
         id: ProfileId::WaveXlrMk2,
         display_name: "Wave XLR MK.2 (0fd9:00a6)",

@@ -52,7 +52,39 @@ fn xlr_patches_preserve_every_reserved_byte_and_decode_signed_headphones() {
         assert!(!state.muted);
         assert_eq!(state.phantom, Some(true));
         assert_eq!(state.low_impedance, Some(false));
-        assert_eq!(state.monitor_mix, None);
+        // Observations are not clamped; only 007d has a mapped mix field.
+        let expected_mix = (profile == ProfileId::WaveXlr).then_some(0xa5a5);
+        assert_eq!(state.monitor_mix, expected_mix);
+    }
+}
+
+/// Config block captured from a physical 007d (firmware 3.7.3, API 1.4) with
+/// `openwave-probe watch`; it contains no serial. Turning the knob in mix mode
+/// changed only bytes 12-13, in steps of 1/24 from 0x0000 (PC only) to
+/// 0x6400 (microphone only). 0x14d5 is the value seen after a power cycle.
+const WAVE_XLR_CAPTURE: [u8; 34] = [
+    0x40, 0x38, 0x00, 0xec, 0x00, 0x01, 0x01, 0x01, 0x00, 0x80, 0xed, 0x00, 0xd5, 0x14, 0x03, 0xff,
+    0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01, 0x00, 0xff, 0x37, 0x00,
+    0x00, 0x01,
+];
+
+#[test]
+fn wave_xlr_monitor_mix_is_a_bounded_u16_at_offset_12() {
+    let mut block = ConfigBuffer::decode(ProfileId::WaveXlr, &WAVE_XLR_CAPTURE).unwrap();
+    let state = block.state();
+    assert_eq!(state.gain_raw, 0x3840);
+    assert_eq!(state.hp_volume_db, -18.5);
+    assert_eq!(state.phantom, Some(true));
+    assert_eq!(state.low_impedance, Some(true));
+    assert_eq!(state.monitor_mix, Some(0x14d5));
+    assert_eq!(state.knob_mode, KnobMode::MonitorMix);
+
+    for (requested, stored) in [(0, 0x0000_u16), (0x3200, 0x3200), (u16::MAX, 0x6400)] {
+        block.apply(DeviceSetting::MonitorMix(requested)).unwrap();
+        let mut expected = WAVE_XLR_CAPTURE;
+        expected[12..14].copy_from_slice(&stored.to_le_bytes());
+        assert_eq!(block.as_bytes(), expected);
+        assert_eq!(block.state().monitor_mix, Some(stored));
     }
 }
 
@@ -87,7 +119,6 @@ fn refused_settings_leave_config_unchanged_and_fail_queue_admission() {
     for (profile, setting) in [
         (ProfileId::Wave3, DeviceSetting::Phantom(true)),
         (ProfileId::Wave3, DeviceSetting::LowImpedance(true)),
-        (ProfileId::WaveXlr, DeviceSetting::MonitorMix(100)),
         (ProfileId::WaveXlrMk2, DeviceSetting::MonitorMix(0)),
     ] {
         let bytes = vec![0x6a; profile.profile().legacy.unwrap().config_len];
@@ -133,14 +164,18 @@ fn observed_out_of_range_values_are_not_rewritten_or_clamped() {
 
 #[test]
 fn knob_modes_follow_profile_specific_mapping_and_unknown_means_gain() {
-    for (profile, length, offset) in [(ProfileId::WaveXlr, 34, 14), (ProfileId::Wave3, 16, 12)] {
+    for (profile, length, offset) in [
+        (ProfileId::WaveXlr, 34, 14),
+        (ProfileId::WaveXlrMk2, 34, 14),
+        (ProfileId::Wave3, 16, 12),
+    ] {
         for (raw, expected) in [
             (0, KnobMode::Gain),
             (1, KnobMode::Gain),
             (2, KnobMode::Headphones),
             (
                 3,
-                if profile == ProfileId::Wave3 {
+                if profile.profile().has_monitor_mix() {
                     KnobMode::MonitorMix
                 } else {
                     KnobMode::Gain
