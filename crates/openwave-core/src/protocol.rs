@@ -138,7 +138,7 @@ impl ConfigBuffer {
         };
         let knob_mode = match self.bytes[p.off_vol_select] {
             2 => KnobMode::Headphones,
-            3 if self.profile == ProfileId::Wave3 => KnobMode::MonitorMix,
+            3 if p.off_monitor_mix.is_some() => KnobMode::MonitorMix,
             _ => KnobMode::Gain,
         };
         DeviceState {

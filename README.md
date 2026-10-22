@@ -22,7 +22,7 @@ OpenWave is an open-source, reverse-engineered alternative to Elgato Wave Link f
 
 - **Multiple devices** — Each supported unit has its own control queue, including two of the same model. The sidebar identifies units by serial, with USB bus/address as a runtime fallback. Selecting another unit does not retarget queued writes.
 - **Microphone controls** — Adjust gain and mute, with 48 V phantom power on supported XLR devices.
-- **Headphone controls** — Set volume, enable low impedance mode on supported devices, or adjust the Wave:3 monitor mix.
+- **Headphone controls** — Set volume, enable low impedance mode on supported devices, or adjust the monitor mix on Wave XLR (`007d`), Wave:3 and XLR Dock MK.2.
 - **Hardware and system sync** — Polling at 10 Hz tracks physical buttons and knobs. Hardware mute and headphone volume synchronize with PipeWire/ALSA.
 - **Hotplug and capture readiness** — Adding or removing a device preserves other connected units. The daemon maintains a keepalive per Wave input; the mixer requires raw capture readiness before Wave playback.
 - **Dynamic mixing** — Add application or hardware sources, independent mixes, per-send levels and outputs, with published capture inputs for OBS and voice applications.
@@ -34,12 +34,12 @@ OpenWave is an open-source, reverse-engineered alternative to Elgato Wave Link f
 
 |Device|USB ID|Available controls|
 |---|---|---|
-|**Wave XLR**|`0fd9:007d`|Gain, mute, 48 V phantom power, headphone volume, low impedance mode|
+|**Wave XLR**|`0fd9:007d`|Gain, mute, 48 V phantom power, headphone volume, low impedance mode, monitor mix|
 |**XLR Dock** (`00a6` variant)|`0fd9:00a6`|Gain, mute, 48 V phantom power, headphone volume, low impedance mode|
 |**Wave:3**|`0fd9:0070`|Gain, mute, headphone volume, monitor mix|
 |**XLR Dock MK.2**|`0fd9:00c7`|Gain, mute, 48 V phantom power, headphone volume, low impedance mode, hardware monitor mix|
 
-Controls are enabled by the device profile. Phantom power and low impedance mode are available on the supported XLR models; monitor mix is available on Wave:3 and XLR Dock MK.2.
+Controls are enabled by the device profile. Phantom power and low impedance mode are available on the supported XLR models; monitor mix is available on Wave XLR (`007d`), Wave:3 and XLR Dock MK.2, but not on the `00a6` variant.
 
 The `00c7` backend implements the independently documented three-block vendor protocol, with read-only detection of its two known control banks. It is not an alias for `00a6`. Software checks cover encoding, transport failures and GTK controls; this native backend has not been exercised on a physical `00c7` unit here. Enabled profiles do not certify every firmware or multi-device combination. See [hardware support and protocol provenance](docs/hardware-support.md).
 
@@ -258,11 +258,11 @@ The legacy profiles use `bRequest=0x85` to read and `bRequest=0x05` to write con
 |Mute|`4`|`4`|
 |48 V phantom power|`6`|—|
 |Headphone volume (`int16`, Q8.8)|`9`|`7`|
-|Monitor mix (`uint16`, Q8.8 percent)|—|`10`|
+|Monitor mix (`uint16`, Q8.8 percent)|`12` (`007d` only)|`10`|
 |Knob / dial mode|`14`|`12`|
 |Low impedance mode|`33`|—|
 
-For Wave:3, dial mode values are `1` = gain, `2` = headphones, and `3` = mix. Per-model constants and capabilities live in [`openwave-core/src/profiles.rs`](crates/openwave-core/src/profiles.rs). See [protocol documentation](docs/protocol.md) for scope and safe probing.
+For Wave:3 and Wave XLR (`007d`), dial/knob mode values are `1` = gain, `2` = headphones, and `3` = mix. The Wave XLR mix is the microphone share: `0x0000` is PC only and `0x6400` is microphone only. Per-model constants and capabilities live in [`openwave-core/src/profiles.rs`](crates/openwave-core/src/profiles.rs). See [protocol documentation](docs/protocol.md) for scope and safe probing.
 </details>
 
 ### Device probing and diagnostics

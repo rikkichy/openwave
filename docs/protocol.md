@@ -39,10 +39,13 @@ The meter begins with two unsigned 32-bit raw levels; their PCM normalization is
 | 4 | byte | Mute: `1` muted, `0` live |
 | 6 | byte | 48 V phantom: `1` on, `0` off |
 | 9 | int16 | Headphone level: raw / 256 dB; zero is unity |
-| 14 | byte | Knob mode: `2` selects headphone volume |
+| 12 | uint16 | `007d` only: microphone/PC mix, raw / 256 percent microphone; `0x0000` PC only, maximum `0x6400` microphone only |
+| 14 | byte | Knob mode: `1` gain, `2` headphone volume, `3` monitor mix on `007d` |
 | 33 | byte | Low impedance mode: `1` on, `0` off |
 
-The `00a6` profile uses this layout. It does not apply to the `00c7` Dock described below, `00b6` or every device sold as a Dock/MK.2.
+The `00a6` profile uses this layout except offset 12, which remains unmapped for `00a6` and is preserved like any other reserved byte. It does not apply to the `00c7` Dock described below, `00b6` or every device sold as a Dock/MK.2.
+
+The `007d` mix field was mapped on one physical unit (firmware 3.7.3, API 1.4) with `openwave-probe watch`: in mix mode, the knob changed only bytes 12–13, in steps of 1/24 of the range from `0x0000` to `0x6400`. After a power cycle the unit reported `0x14d5` (about 21% microphone).
 
 ### Wave:3: `0fd9:0070`
 
