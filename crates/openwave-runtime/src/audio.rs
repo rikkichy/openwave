@@ -80,6 +80,10 @@ impl PinWatch {
     pub fn status(&self) -> PinStatus {
         self.status
     }
+    /// The keepalive has received capture data since it (re)started.
+    pub fn received(&self) -> bool {
+        self.received
+    }
     pub fn step(
         &mut self,
         now: Instant,
@@ -422,6 +426,7 @@ fn audio_loop(
     wake: mpsc::Receiver<()>,
 ) -> Result<()> {
     let runner = CommandRunner::new(cancel.clone());
+    let guard = crate::guard::PlaybackGuard::start();
     let mut pins: HashMap<String, Pin> = HashMap::new();
     let mut dormant: HashMap<String, PinWatch> = HashMap::new();
     let mut previous = None;
@@ -498,7 +503,11 @@ fn audio_loop(
         }
         for pin in pins.values_mut() {
             let alive = pin.observe();
-            if pin.watch.step(now, alive, true, pin.node.muted) == PinAction::Restart {
+            let action = pin.watch.step(now, alive, true, pin.node.muted);
+            if pin.watch.received() {
+                guard.capture_running(&pin.node.name);
+            }
+            if action == PinAction::Restart {
                 log::warn!(
                     "Capture {} {:?}; recycling owned keepalive",
                     pin.node.name,
