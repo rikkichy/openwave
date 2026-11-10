@@ -1,10 +1,13 @@
 //! Bounded command execution and exclusively owned audio process groups.
 use openwave_core::model::{ErrorCode, OperationError, Result};
-use rustix::process::{Pid, Signal, WaitId, WaitIdOptions};
+use rustix::{
+    event::{PollFd, PollFlags, Timespec},
+    process::{Pid, Signal, WaitId, WaitIdOptions},
+};
 use std::{
     io::{ErrorKind, Read},
     os::{fd::AsFd, unix::process::CommandExt},
-    process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Output, Stdio},
+    process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Output, Stdio},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -330,7 +333,10 @@ impl CommandRunner {
             if out_done && err_done {
                 thread::sleep(TICK);
             } else {
-                thread::sleep(Duration::from_millis(2));
+                await_output(
+                    (!out_done).then_some(&stdout),
+                    (!err_done).then_some(&stderr),
+                )?;
             }
         }
         let output = Output {
@@ -350,6 +356,28 @@ impl CommandRunner {
 }
 fn cancelled() -> OperationError {
     OperationError::new(ErrorCode::Cancelled, "Command cancelled")
+}
+
+// Wake as soon as a pipe is readable instead of sleeping a fixed step per pipe
+// buffer. A user over fs.pipe-user-pages-soft gets 8 KiB pipes, where a fixed
+// step turns a 2 MiB pw-dump into half a second. One TICK still bounds the wait
+// so the caller's cancellation and deadline checks keep their cadence.
+fn await_output(stdout: Option<&ChildStdout>, stderr: Option<&ChildStderr>) -> Result<()> {
+    let mut fds = Vec::with_capacity(2);
+    if let Some(stdout) = stdout {
+        fds.push(PollFd::new(stdout, PollFlags::IN));
+    }
+    if let Some(stderr) = stderr {
+        fds.push(PollFd::new(stderr, PollFlags::IN));
+    }
+    let tick = Timespec {
+        tv_sec: 0,
+        tv_nsec: TICK.subsec_nanos().into(),
+    };
+    match rustix::event::poll(&mut fds, Some(&tick)) {
+        Ok(_) | Err(rustix::io::Errno::INTR) => Ok(()),
+        Err(error) => Err(os_error(error)),
+    }
 }
 
 // Limit work per turn as well as total retained output: an endless producer

@@ -30,6 +30,11 @@ const CLEANUP_SETTLE: Duration = Duration::from_millis(100);
 // A full pass costs two pw-dumps and five pactl calls (~190 ms live), so a held
 // dial retunes routes in place and the verifying pass waits for it to settle.
 const RETUNE_SETTLE: Duration = Duration::from_millis(250);
+// A capture mute is confirmed only by a later sample of the same incarnation, and
+// a group handover holds the opening microphone silent until then. Take that
+// sample promptly instead of a whole poll later; bounded so a write that never
+// confirms falls back to the ordinary poll.
+const CAPTURE_CONFIRM: Duration = Duration::from_millis(50);
 fn unavailable(message: impl Into<String>) -> OperationError {
     OperationError::new(ErrorCode::Unavailable, message)
 }
@@ -1039,6 +1044,8 @@ impl Reconciler {
         // A full pass owed after in-place retunes: (first retune, quiet deadline).
         // Capped at one interval so a dial held forever still gets verified.
         let mut owed: Option<(Instant, Instant)> = None;
+        // End of the prompt confirming passes owed to written capture mutes.
+        let mut confirming: Option<Instant> = None;
         loop {
             let (woken, captures_pending, update) = {
                 let mut control = self
@@ -1086,12 +1093,21 @@ impl Reconciler {
             if control.stopped {
                 break;
             }
+            let unconfirmed = control
+                .capture_requests
+                .values()
+                .any(|request| request.written.is_some());
+            if !unconfirmed {
+                confirming = None;
+            }
             if !control.wake {
-                let timeout = owed.map_or(interval, |(first, quiet)| {
-                    quiet
-                        .min(first + interval)
-                        .saturating_duration_since(Instant::now())
+                let now = Instant::now();
+                let mut timeout = owed.map_or(interval, |(first, quiet)| {
+                    quiet.min(first + interval).saturating_duration_since(now)
                 });
+                if unconfirmed && now < *confirming.get_or_insert(now + interval) {
+                    timeout = timeout.min(CAPTURE_CONFIRM);
+                }
                 let _guard = self
                     .shared
                     .wake
