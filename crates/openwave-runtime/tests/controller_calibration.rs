@@ -125,10 +125,13 @@ impl Fixture {
         fixture
     }
     fn graph(&self, capture: CaptureSnapshot) {
+        self.graph_with(vec![capture]);
+    }
+    fn graph_with(&self, captures: Vec<CaptureSnapshot>) {
         self.incoming
             .send(BackendEvent::Graph(MixerObservation {
                 observation: Observation::Known(()),
-                captures: vec![capture],
+                captures,
                 streams: Vec::new(),
                 outputs: Vec::new(),
                 default_sink: None,
@@ -500,6 +503,43 @@ fn recreated_raw_node_cannot_accept_review_from_previous_serial() {
         CommandOutcome::Rejected(_)
     ));
     assert_eq!(fixture.bytes(), before);
+}
+
+#[test]
+fn unrelated_capture_churn_keeps_review_valid() {
+    let mut fixture = Fixture::new(Some(2));
+    let token = fixture.start();
+    let proposal = fixture.review(&token);
+    let mut other = fixture.capture.clone();
+    other.node_name = "other_raw".into();
+    other.node_id = 11;
+    other.identity.object_serial = "4321".into();
+    other
+        .properties
+        .insert("object.serial".into(), serde_json::json!(4321));
+    fixture.graph_with(vec![fixture.capture.clone(), other]);
+    fixture.until(|snapshot| snapshot.captures.len() == 2);
+    fixture.graph(fixture.capture.clone());
+    fixture.until(|snapshot| snapshot.captures.len() == 1);
+    assert!(matches!(
+        fixture
+            .handle
+            .snapshot()
+            .calibration
+            .as_ref()
+            .map(|s| &s.phase),
+        Some(CalibrationPhase::Review { .. })
+    ));
+    assert!(matches!(
+        fixture.submit(AppCommand::AcceptCalibration { token }),
+        CommandOutcome::Applied { .. }
+    ));
+    let snapshot = fixture.until(|snapshot| snapshot.calibration.is_none());
+    let applied = snapshot.desired.sources[&fixture.source]
+        .fx
+        .as_ref()
+        .unwrap();
+    assert_eq!(applied.gate_thresh, proposal.gate_thresh);
 }
 
 #[test]

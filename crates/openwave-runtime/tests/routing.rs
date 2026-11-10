@@ -6,7 +6,7 @@ use openwave_runtime::{
 };
 use serde_json::{Map, Value, json};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     path::Path,
     sync::{Arc, Mutex, mpsc},
     thread,
@@ -50,6 +50,7 @@ fn assert_survives_in_place_parse(text: &[u8]) {
     }
 }
 
+type GraphChange = Box<dyn FnOnce(&mut World) + Send>;
 #[derive(Default)]
 struct World {
     cookie: u32,
@@ -85,6 +86,8 @@ struct World {
     fail_snapshots: usize,
     fail_snapshots_on_terminate: usize,
     panic_snapshot: bool,
+    /// Graph changes applied between one discovery attempt's two pw-dump listings.
+    during_discovery: VecDeque<GraphChange>,
     mute_gate: Option<(String, mpsc::Sender<()>, mpsc::Receiver<()>)>,
     default_sink: Option<String>,
 }
@@ -220,15 +223,30 @@ impl World {
                 })
         })
     }
-    fn snapshot(&self) -> Result<GraphSnapshot> {
+    /// One pw-dump listing of the current world.
+    fn listing(&self) -> Value {
         let mut objects: Vec<_> = self.objects.values().cloned().collect();
         objects
             .push(json!({"id":0,"type":"PipeWire:Interface:Core","info":{"cookie":self.cookie}}));
         for (i, (output, input)) in self.links.iter().enumerate() {
             objects.push(json!({"id":1000000+i,"type":"PipeWire:Interface:Link","info":{"output-port-id":output,"input-port-id":input}}));
         }
+        json!(objects)
+    }
+    /// Discovery as the subprocess backend performs it: parse the first listing, let the
+    /// graph change, then confirm the parsed nodes against a second listing.
+    fn discover(&mut self) -> Result<GraphSnapshot> {
+        let Some(change) = self.during_discovery.pop_front() else {
+            return self.snapshot();
+        };
+        let graph = self.snapshot()?;
+        change(self);
+        graph.confirm_nodes_unchanged(&self.listing())?;
+        Ok(graph)
+    }
+    fn snapshot(&self) -> Result<GraphSnapshot> {
         GraphSnapshot::parse(
-            &json!(objects),
+            &self.listing(),
             &json!(self.sinks.values().collect::<Vec<_>>()),
             &json!(self.sources.values().collect::<Vec<_>>()),
             &json!(self.inputs.values().collect::<Vec<_>>()),
@@ -294,7 +312,7 @@ impl GraphBackend for FakeBackend {
         if w.fail_snapshot {
             Err(failed())
         } else {
-            w.snapshot()
+            w.discover()
         }
     }
     fn write_definitions(&mut self, mixes: &Mixes) -> Result<()> {
@@ -1420,6 +1438,100 @@ fn unknown_discovery_retains_snapshot_and_does_not_mutate() {
             .mutations,
         mutations
     );
+}
+
+/// Quiet fixture with one raw capture, observed once; returns its observed identity.
+fn churn_fixture() -> (Fixture, NodeIdentity) {
+    let mut f = Fixture::quiet();
+    f.world.lock().unwrap().capture("mic", 1);
+    f.device("mic", "mic", 1);
+    f.apply();
+    let observed = f.observation(|o| o.revision == f.revision && o.observation.known().is_some());
+    (f, observed.captures[0].identity.clone())
+}
+/// Wake one pass and return its observation, failing on any Unknown sample before it.
+fn next_known_pass(f: &mut Fixture) -> openwave_runtime::mixer::MixerObservation {
+    f.apply();
+    loop {
+        let MixerEvent::Observed(o) = f.events.recv_timeout(Duration::from_secs(4)).unwrap() else {
+            continue;
+        };
+        if let Observation::Unknown(error) = &o.observation {
+            panic!("pass published an unknown graph: {error}");
+        }
+        if o.revision == f.revision {
+            return o;
+        }
+    }
+}
+
+#[test]
+fn foreign_stream_exiting_mid_discovery_retries_instead_of_unknown() {
+    let (mut f, mic) = churn_fixture();
+    let snapshots = {
+        let mut w = f.world.lock().unwrap();
+        // A short-lived record stream (e.g. a voice client's probe) that exits between
+        // the two pw-dump listings of one pass.
+        let probe = w.node(
+            "vesktop_probe",
+            props(json!({"media.class":"Stream/Input/Audio"})),
+        );
+        w.during_discovery
+            .push_back(Box::new(move |w: &mut World| w.remove_node(probe)));
+        w.snapshots
+    };
+    let observed = next_known_pass(&mut f);
+    assert_eq!(observed.captures[0].identity, mic);
+    let w = f.world.lock().unwrap();
+    assert!(w.during_discovery.is_empty());
+    assert_eq!(w.snapshots, snapshots + 2, "one failed attempt, one retry");
+    assert_eq!(w.node_id("vesktop_probe"), None);
+}
+
+#[test]
+fn raw_capture_recreated_mid_discovery_publishes_its_new_identity() {
+    let (mut f, mic) = churn_fixture();
+    f.world
+        .lock()
+        .unwrap()
+        .during_discovery
+        .push_back(Box::new(|w: &mut World| {
+            w.capture("mic", 1);
+        }));
+    let observed = next_known_pass(&mut f);
+    let current = f.world.lock().unwrap().identity("mic");
+    assert_ne!(current, mic);
+    // The retried observation names the replacement, so identity-bound consumers such
+    // as calibration still see the change rather than a stale capture.
+    assert_eq!(observed.captures[0].identity, current);
+}
+
+#[test]
+fn persistent_churn_still_reports_unknown_without_mutating() {
+    let (mut f, mic) = churn_fixture();
+    let mutations = {
+        let mut w = f.world.lock().unwrap();
+        for i in 0..3 {
+            let probe = w.node(
+                &format!("probe_{i}"),
+                props(json!({"media.class":"Stream/Input/Audio"})),
+            );
+            w.during_discovery
+                .push_back(Box::new(move |w: &mut World| w.remove_node(probe)));
+        }
+        w.mutations
+    };
+    f.apply();
+    let unknown = f.observation(|o| o.observation.known().is_none());
+    assert!(
+        unknown
+            .errors
+            .iter()
+            .any(|e| e.message.contains("changed during discovery"))
+    );
+    assert_eq!(unknown.captures[0].identity, mic);
+    assert_eq!(f.world.lock().unwrap().mutations, mutations);
+    assert_eq!(next_known_pass(&mut f).captures[0].identity, mic);
 }
 
 #[test]
