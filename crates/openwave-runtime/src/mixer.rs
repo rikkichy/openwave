@@ -198,6 +198,35 @@ impl GraphSnapshot {
         }
         Ok(cookie)
     }
+    /// Confirm every parsed node still has its id and object.serial in a later pw-dump
+    /// taken after the Pulse listings. A cookie alone cannot detect a node recycled
+    /// between the independent clients, so any change, owned or foreign, is an identity
+    /// error; callers retry the whole observation rather than narrow this check.
+    pub fn confirm_nodes_unchanged(&self, later: &Value) -> Result<()> {
+        let later_nodes: HashMap<_, _> = later
+            .as_array()
+            .ok_or_else(|| unavailable("pw-dump did not return an array"))?
+            .iter()
+            .filter(|o| o.get("type").and_then(Value::as_str) == Some("PipeWire:Interface:Node"))
+            .map(|o| {
+                (
+                    number(o.get("id")),
+                    text(
+                        o.get("info")
+                            .and_then(|i| i.get("props"))
+                            .and_then(|p| p.get("object.serial")),
+                    ),
+                )
+            })
+            .collect();
+        for node in &self.nodes {
+            let expected = text(node.properties.get("object.serial"));
+            if later_nodes.get(&Some(node.id)) != Some(&expected) {
+                return Err(identity_error("PipeWire nodes changed during discovery"));
+            }
+        }
+        Ok(())
+    }
     /// Parse one coherent server observation. Missing/malformed state is not an empty graph.
     pub fn parse(
         objects: &Value,
@@ -579,29 +608,7 @@ impl GraphBackend for SubprocessPipeWire {
         let graph = GraphSnapshot::parse(
             &objects, &pulse[0], &pulse[1], &pulse[2], &pulse[3], default,
         )?;
-        // A cookie alone cannot detect a node recycled between the independent clients.
-        let later_nodes: HashMap<_, _> = after
-            .as_array()
-            .expect("validated array")
-            .iter()
-            .filter(|o| o.get("type").and_then(Value::as_str) == Some("PipeWire:Interface:Node"))
-            .map(|o| {
-                (
-                    number(o.get("id")),
-                    text(
-                        o.get("info")
-                            .and_then(|i| i.get("props"))
-                            .and_then(|p| p.get("object.serial")),
-                    ),
-                )
-            })
-            .collect();
-        for node in &graph.nodes {
-            let expected = text(node.properties.get("object.serial"));
-            if later_nodes.get(&Some(node.id)) != Some(&expected) {
-                return Err(identity_error("PipeWire nodes changed during discovery"));
-            }
-        }
+        graph.confirm_nodes_unchanged(&after)?;
         Ok(graph)
     }
     fn write_definitions(&mut self, mixes: &Mixes) -> Result<()> {
@@ -1213,11 +1220,27 @@ impl Reconciler {
         self.desired = desired;
         self.revision = Some(revision);
     }
+    /// One observation for a full pass. An identity failure means the graph changed
+    /// between the independent pw-dump/pactl clients, which any unrelated stream exiting
+    /// can cause (OpenWave's own calibration and meter captures included). Like cleanup,
+    /// retry the whole observation; never weaken its identity checks. Other failures are
+    /// reported at once so a stalled tool does not multiply the pass latency.
+    fn discover(&mut self) -> Result<GraphSnapshot> {
+        let mut remaining = CLEANUP_ATTEMPTS;
+        loop {
+            match self.backend.snapshot() {
+                Err(error) if error.code == ErrorCode::Identity && remaining > 1 => {
+                    remaining -= 1;
+                    thread::sleep(CLEANUP_SETTLE);
+                }
+                result => return result,
+            }
+        }
+    }
     fn cycle(&mut self) {
         self.pending_masters.clear();
         self.discovery_error = None;
-        let result = self.backend.snapshot();
-        let mut graph = match result {
+        let mut graph = match self.discover() {
             Ok(graph) => graph,
             Err(error) => {
                 let mut observation = self.last.clone();
