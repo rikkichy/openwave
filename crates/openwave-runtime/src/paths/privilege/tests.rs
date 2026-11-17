@@ -226,7 +226,7 @@ fn inaccessible_identity_is_not_treated_as_already_deleted() {
     let parent = home.path().join("blocked");
     let identity = parent.join("identity");
     private(&identity);
-    fs::set_permissions(&parent, fs::Permissions::from_mode(0)).unwrap();
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o0)).unwrap();
     let result = installation_lock_name(&identity, true);
     fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
     assert!(result.is_err());

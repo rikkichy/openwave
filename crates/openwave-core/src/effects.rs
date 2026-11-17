@@ -240,7 +240,7 @@ pub fn render_fx_config(source: &Source, channels: u32, owner: &str) -> Result<O
             add(
                 "hp",
                 "bq_highpass",
-                Some(json!({"Freq":settings.lowcut,"Q":0.70710678})),
+                Some(json!({"Freq":settings.lowcut,"Q":std::f64::consts::FRAC_1_SQRT_2})),
                 None,
                 None,
             );
@@ -280,7 +280,7 @@ pub fn render_fx_config(source: &Source, channels: u32, owner: &str) -> Result<O
                 add(
                     key,
                     label,
-                    Some(json!({"Freq":frequency,"Gain":gain,"Q":0.70710678})),
+                    Some(json!({"Freq":frequency,"Gain":gain,"Q":std::f64::consts::FRAC_1_SQRT_2})),
                     None,
                     None,
                 );
