@@ -1593,6 +1593,36 @@ fn pending_capture_mute_retries_on_new_node_only_with_same_epoch() {
 }
 
 #[test]
+fn written_capture_mute_is_confirmed_promptly_then_polling_goes_quiet() {
+    // No timed pass for a minute: only the prompt confirming pass can report the
+    // mute as known, and a group handover waits on exactly that report.
+    let mut f = Fixture::quiet();
+    f.world
+        .lock()
+        .expect("routing fixture lock poisoned")
+        .capture("microphone", 1);
+    f.device("mic", "microphone", 5);
+    f.apply();
+    f.cycles(1);
+    f.mixer
+        .set_capture_mute("microphone".into(), f.bindings["microphone"].clone(), true)
+        .unwrap();
+    f.observation(|o| {
+        o.captures
+            .iter()
+            .any(|c| c.node_name == "microphone" && c.muted.known() == Some(&true))
+    });
+    let settled = f
+        .world
+        .lock()
+        .expect("routing fixture lock poisoned")
+        .snapshots;
+    thread::sleep(Duration::from_millis(250));
+    let w = f.world.lock().expect("routing fixture lock poisoned");
+    assert_eq!(w.snapshots, settled, "confirmed mute kept polling");
+}
+
+#[test]
 fn unowned_capture_request_is_rejected_before_a_later_binding() {
     let mut f = Fixture::new();
     f.world
