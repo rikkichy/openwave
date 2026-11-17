@@ -45,6 +45,7 @@ impl ActionRegistry {
             ("save-scene", String::static_variant_type()),
             ("delete-scene", String::static_variant_type()),
             ("toggle-fx", <(String, String)>::static_variant_type()),
+            ("set-output", <(String, String)>::static_variant_type()),
         ] {
             let action = gio::SimpleAction::new(name, Some(&signature));
             let runtime = handle.clone();
@@ -189,6 +190,14 @@ fn command(name: &str, value: &Variant) -> Result<AppCommand> {
                 effect,
             }
         }
+        "set-output" => {
+            let (mix, choice): (String, String) = parameter(value)?;
+            // The controller validates the choice, exactly as for the window's dropdown.
+            AppCommand::SetOutput {
+                mix: MixId::new(mix)?,
+                choice,
+            }
+        }
         "save-scene" => AppCommand::SaveScene {
             name: parameter(value)?,
         },
@@ -200,4 +209,26 @@ fn command(name: &str, value: &Variant) -> Result<AppCommand> {
         },
         _ => return Err(OperationError::invalid("Unknown remote action")),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_output_maps_mix_and_choice() {
+        let value = ("chat".to_string(), "alsa_output.usb-headset".to_string()).to_variant();
+        match command("set-output", &value).expect("valid parameter") {
+            AppCommand::SetOutput { mix, choice } => {
+                assert_eq!(mix.as_str(), "chat");
+                assert_eq!(choice, "alsa_output.usb-headset");
+            }
+            other => panic!("unexpected command {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_output_rejects_wrong_parameter_type() {
+        assert!(command("set-output", &"chat".to_variant()).is_err());
+    }
 }

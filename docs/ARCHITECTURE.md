@@ -148,6 +148,7 @@ The session-bus name is `com.github.openwave`, object path `/com/github/openwave
 | `save-scene` | `s` | Display name for the saved scene |
 | `delete-scene` | `s` | Scene ID |
 | `toggle-fx` | `(ss)` | Source ID, effect key |
+| `set-output` | `(ss)` | Mix ID, output choice: `auto`, `none` or a sink `node.name` |
 
 Read-only actions have no activation parameter: `source-groups` exposes state type `as` (string array); `snapshot`, `scenes` and `levels` expose state type `s` containing JSON. `snapshot` and `source-groups` push changes from the running window. Activate `scenes` or `levels` to refresh their state before reading. Use `Describe`/`DescribeAll` to inspect states, or subscribe to `Changed` for pushed updates. For example:
 
