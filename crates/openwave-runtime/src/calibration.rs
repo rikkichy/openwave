@@ -52,7 +52,8 @@ pub fn capture_raw(
     cancel: Arc<AtomicBool>,
 ) -> Result<Vec<u8>> {
     validate_capture(node_name, seconds, channels)?;
-    let args = vec!["--record".into(), "--target".into(), node_name.into(), "--rate".into(), RATE.to_string(),
+    // --raw: without it, pw-cat may wrap stdout in a big-endian AU container.
+    let args = vec!["--raw".into(), "--record".into(), "--target".into(), node_name.into(), "--rate".into(), RATE.to_string(),
         "--channels".into(), channels.to_string(), "--format".into(), "s16".into(), "--properties".into(),
         r#"{ "media.name": "openwave_calibration", "node.name": "openwave_calibration", "application.name": "OpenWave", "node.dont-reconnect": true, "node.dont-fallback": true, "node.dont-move": true }"#.into(), "-".into()];
     capture_with(

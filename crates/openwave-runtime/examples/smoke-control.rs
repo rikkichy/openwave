@@ -303,7 +303,8 @@ fn record(source: &str, file: &str, expected: f64) -> Result {
             "--kill-after=2",
             "10",
             "pw-cat",
-            // Stdout is headerless PCM on PipeWire 1.0 as well as newer releases.
+            // --raw keeps stdout headerless PCM; pw-cat may otherwise write AU (seen on PipeWire 1.6.11).
+            "--raw",
             "--record",
             "--format=f32",
             "--rate=48000",

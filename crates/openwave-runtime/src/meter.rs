@@ -477,6 +477,8 @@ fn meter_reader(
 ) -> Result<()> {
     let props = serde_json::json!({"node.name": format!("openwave_meter_{}", target.key), "node.description": format!("OpenWave level meter ({})", target.key), "application.name":"OpenWave", "media.name":format!("OpenWave meter: {}", target.key), "node.dont-fallback":true, "node.dont-reconnect":true, "node.dont-move":true, "stream.capture.sink": !target.raw});
     let args = vec![
+        // Without --raw, pw-cat may wrap stdout in a big-endian AU container.
+        "--raw".into(),
         "--record".into(),
         "--target".into(),
         target.identity.object_serial.clone(),
